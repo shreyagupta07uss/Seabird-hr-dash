@@ -1,20 +1,39 @@
+/// <reference types="vite/client" />
 // Real API Service - Connects to SeaBird FastAPI Backend
 // Base URL: http://localhost:8000/api/v1
 
-const API_BASE = "http://localhost:8000/api/v1";
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api/v1";
 
-// Helper to handle fetch with error handling, timeout, and abort support
+// Helper to handle fetch with error handling, timeout, abort support, and AUTH
 async function fetchJSON<T>(url: string, options?: RequestInit & { timeout?: number }): Promise<T> {
-    const timeout = options?.timeout || 300000; // 5 minutes default for uploads
+    const timeout = options?.timeout || 300000;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    // ── AUTO-INJECT AUTH TOKEN ──
+    const token = localStorage.getItem("token");
+    const headers: Record<string, string> = {
+        ...(options?.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+        ...(token && { Authorization: `Bearer ${token}` }),
+        ...((options?.headers as Record<string, string>) || {}),
+    };
 
     try {
         const res = await fetch(url, {
             ...options,
+            headers,
             signal: controller.signal,
         });
         clearTimeout(timeoutId);
+
+        // Auto-logout on 401
+        if (res.status === 401) {
+            localStorage.removeItem("token");
+            localStorage.removeItem("user");
+            window.location.reload();
+            throw new Error("Session expired. Please log in again.");
+        }
+
         if (!res.ok) {
             const err = await res.json().catch(() => ({ detail: res.statusText }));
             throw new Error(err.detail || `HTTP ${res.status}`);
@@ -30,9 +49,28 @@ async function fetchJSON<T>(url: string, options?: RequestInit & { timeout?: num
 }
 
 // ============================================================================
-// TYPES (matching backend Pydantic/JSON responses exactly)
+// AUTH TYPES
 // ============================================================================
+export interface User {
+    id: number;
+    name: string;
+    username: string;
+    role: string;
+}
 
+export interface LoginPayload {
+    username: string;
+    password: string;
+}
+
+export interface LoginResponse {
+    token: string;
+    user: User;
+}
+
+// ============================================================================
+// EXISTING TYPES (unchanged)
+// ============================================================================
 export interface KPIData {
     total_employees: number;
     present: number;
@@ -52,11 +90,10 @@ export interface KPIData {
     less_working_hours: number;
     alternate_shift: number;
     ot_eligible: number;
-    headcount: number;  // Present + OT adjusted (+0.25 for 2hrs, +0.5 for 4hrs)
+    headcount: number;
     new_joiners: number;
     no_data: number;
     selected_date: string;
-    
 }
 
 export interface TrendData {
@@ -100,12 +137,12 @@ export interface ReconciliationRecord {
 export interface Employee {
     id: number;
     pr_number: string;
-    bio_id: string | null;   // ADDED: Master's real 'Bio' column, now returned by /employees
-    emp_code: string | null; // backend only populates this once ESSL matches a PayCode - can be null
+    bio_id: string | null;
+    emp_code: string | null;
     name: string;
     vendor: string | null;
     store: string | null;
-    department: string | null; // backend backfills this from Tata - null until a Tata upload has run
+    department: string | null;
     designation: string | null;
     status: string;
     shift: string | null;
@@ -152,10 +189,6 @@ export interface UploadLog {
     uploaded_at: string;
 }
 
-// ADDED: typed upload response so UploadCenter.tsx can show real row/sheet counts instead
-// of a generic "uploaded successfully!" alert (previously typed as Promise<any>).
-// EXTENDED: added the fields returned by the new /upload/daywise endpoint (date, per-source
-// row counts, and which of the three expected sheets were actually found).
 export interface UploadResult {
     status: string;
     type: string;
@@ -165,7 +198,6 @@ export interface UploadResult {
     monthly_records_created?: number;
     filename?: string;
     message?: string;
-    // daywise-only fields (present when type === 'daywise')
     date?: string;
     essl_rows_processed?: number;
     tata_rows_processed?: number;
@@ -271,14 +303,12 @@ export interface SettingsData {
     category_rules: Record<string, any>;
 }
 
-// ADDED: matches the new /api/v1/data-quality/unmatched endpoint
 export interface UnmatchedRecord {
     pr_number: string;
     name: string;
     record_count: number;
 }
 
-// ADDED: matches the new /api/v1/analytics/* predictive analytics endpoints
 export interface WeekdayStat {
     weekday: string;
     avg_attendance_pct: number;
@@ -329,91 +359,101 @@ export interface OtTrendResponse {
     note?: string;
 }
 
-
 export interface EmployeeSummary {
-  pr_number: string;
-  name: string;
-  month: string;
-  employee: {
+    pr_number: string;
     name: string;
-    vendor: string;
-    store: string;
-    department: string;
-    designation: string;
-    category: string;
-    shift: string;
-    status: string;
-  };
-  summary: {
-    total_days: number;
-    present: number;
-    absent: number;
-    half_day: number;
-    leave: number;
-    weekoff: number;
-    single_punch: number;
-    late_punch: number;
-    early_departure: number;
-    less_working_hours: number;
-    no_data: number;
-    attendance_percentage: number;
-    effective_present_days: number;
-  };
-  penalty: {
-    late_punch_penalty_days: number;
-    late_punch_count: number;
-    late_punch_label: string;
-    next_penalty_at: number;
-    half_day_penalty_days: number;
-    total_penalty_days: number;
-    action_required: boolean;
-  };
-  days: Array<{
-    date: string;
-    attendance_status: string;
-    issue: string;
-    essl_in: string | null;
-    essl_out: string | null;
-    tata_in: string | null;
-    tata_out: string | null;
-    final_in: string | null;
-    final_out: string | null;
-    worked_hours: number | null;
-    ot_hours: number | null;
-    late_minutes: number | null;
-    early_minutes: number | null;
-    single_punch: string;
-    shift: string | null;
-    remark: string | null;
-  }>;
+    month: string;
+    employee: {
+        name: string;
+        vendor: string;
+        store: string;
+        department: string;
+        designation: string;
+        category: string;
+        shift: string;
+        status: string;
+    };
+    summary: {
+        total_days: number;
+        present: number;
+        absent: number;
+        half_day: number;
+        leave: number;
+        weekoff: number;
+        single_punch: number;
+        late_punch: number;
+        early_departure: number;
+        less_working_hours: number;
+        no_data: number;
+        attendance_percentage: number;
+        effective_present_days: number;
+    };
+    penalty: {
+        late_punch_penalty_days: number;
+        late_punch_count: number;
+        late_punch_label: string;
+        next_penalty_at: number;
+        half_day_penalty_days: number;
+        total_penalty_days: number;
+        action_required: boolean;
+    };
+    days: Array<{
+        date: string;
+        attendance_status: string;
+        issue: string;
+        essl_in: string | null;
+        essl_out: string | null;
+        tata_in: string | null;
+        tata_out: string | null;
+        final_in: string | null;
+        final_out: string | null;
+        worked_hours: number | null;
+        ot_hours: number | null;
+        late_minutes: number | null;
+        early_minutes: number | null;
+        single_punch: string;
+        shift: string | null;
+        remark: string | null;
+    }>;
 }
 
 // ============================================================================
-// REAL API FUNCTIONS - Direct fetch to FastAPI backend
+// AUTH API
 // ============================================================================
+export const authAPI = {
+    login: (payload: LoginPayload): Promise<LoginResponse> =>
+        fetchJSON(`${API_BASE}/auth/login`, {
+            method: "POST",
+            body: JSON.stringify(payload),
+        }),
 
+    me: (): Promise<User> =>
+        fetchJSON(`${API_BASE}/auth/me`),
+
+    logout: (): Promise<{ status: string }> =>
+        fetchJSON(`${API_BASE}/auth/logout`, { method: "POST" }),
+};
+
+// ============================================================================
+// EXISTING API (unchanged, now auto-sends Bearer token via fetchJSON)
+// ============================================================================
 export const api = {
-    // Health
     health: async (): Promise<any> => {
         return fetchJSON(`${API_BASE}/health`);
     },
 
-    // KPIs
     getKPIs: async (target_date: string): Promise<KPIData> => {
         return fetchJSON(`${API_BASE}/kpis?target_date=${target_date}`);
     },
 
-    // Trends
     getTrends: async (target_date: string, days: number = 30): Promise<TrendData[]> => {
         return fetchJSON(`${API_BASE}/trends?target_date=${target_date}&days=${days}`);
     },
 
-    // Breakdowns
     getBreakdown: async (type: 'vendors' | 'stores' | 'departments' | 'shifts', target_date: string): Promise<BreakdownItem[]> => {
         return fetchJSON(`${API_BASE}/breakdown/${type}?target_date=${target_date}`);
     },
 
-    // HR Actions
     getActionSummary: async (): Promise<any> => {
         return fetchJSON(`${API_BASE}/actions/summary`);
     },
@@ -431,12 +471,10 @@ export const api = {
         });
     },
 
-    // AI Insights
     getAIInsights: async (): Promise<AIInsight[]> => {
         return fetchJSON(`${API_BASE}/ai-insights`);
     },
 
-    // Attendance
     getDailyAttendance: async (
         date: string,
         vendor?: string,
@@ -454,7 +492,7 @@ export const api = {
         if (store) params.append('store', store);
         if (department) params.append('department', department);
         if (status) params.append('status', status);
-        if (issue) params.append('issue', issue);  // FIX v3.2.5: Pass issue filter
+        if (issue) params.append('issue', issue);
         if (search) params.append('search', search);
         params.append('page', page.toString());
         params.append('page_size', page_size.toString());
@@ -468,7 +506,6 @@ export const api = {
         return fetchJSON(url);
     },
 
-    // Employees
     getEmployees: async (
         search?: string,
         vendor?: string,
@@ -489,7 +526,6 @@ export const api = {
         return fetchJSON(`${API_BASE}/employees?${params.toString()}`);
     },
 
-    // Master Data Lists
     getVendors: async (): Promise<BreakdownItem[]> => {
         return fetchJSON(`${API_BASE}/vendors`);
     },
@@ -502,10 +538,6 @@ export const api = {
         return fetchJSON(`${API_BASE}/departments`);
     },
 
-    // ADDED: thin wrappers around getVendors/getStores/getDepartments above, returning just
-    // the names. Employees.tsx, Attendance.tsx and Reports.tsx use these for filter dropdowns
-    // that used to be hardcoded to fake values ("Store A/B/C/D", "SeaBird, Venus, Apex") which
-    // never matched a real record (real vendors are SLL/SG/SSE).
     getVendorNames: async (): Promise<string[]> => {
         const vendors = await api.getVendors();
         return vendors.map(v => v.name).filter(Boolean).sort();
@@ -521,7 +553,6 @@ export const api = {
         return departments.map(d => d.name).filter(Boolean).sort();
     },
 
-    // Overtime
     getOTSummary: async (): Promise<any> => {
         return fetchJSON(`${API_BASE}/overtime/summary`);
     },
@@ -539,24 +570,18 @@ export const api = {
         });
     },
 
-    // Reports
     getReports: async (): Promise<ReportItem[]> => {
         return fetchJSON(`${API_BASE}/reports`);
     },
 
-    // Settings
     getSettings: async (): Promise<SettingsData> => {
         return fetchJSON(`${API_BASE}/settings`);
     },
 
-    // Upload History
     getUploadHistory: async (): Promise<UploadLog[]> => {
         return fetchJSON(`${API_BASE}/upload/history`);
     },
 
-    // Upload Endpoints
-    // CHANGED: return type is now UploadResult instead of `any`, so UploadCenter.tsx can
-    // show real rows_processed / sheets_read / sheets_skipped instead of a blind alert.
     uploadMaster: async (file: File, force: boolean = false): Promise<UploadResult> => {
         const formData = new FormData();
         formData.append('file', file);
@@ -574,7 +599,7 @@ export const api = {
         return fetchJSON(`${API_BASE}/upload/essl`, {
             method: 'POST',
             body: formData,
-            timeout: 600000, // 10 minutes for large ESSL files
+            timeout: 600000,
         });
     },
 
@@ -598,10 +623,6 @@ export const api = {
         });
     },
 
-    // ADDED: matches the new backend /api/v1/upload/daywise endpoint - one workbook with
-    // 'Essl In' / 'Essl Out' / 'Tata' sheets for a single day. target_date is optional; the
-    // backend auto-detects it from the Tata sheet's own Date column, and only needs it as an
-    // explicit override (format 'DD/MM/YYYY' or 'YYYY-MM-DD') if that auto-detection fails.
     uploadDaywise: async (file: File, targetDate?: string, force: boolean = false): Promise<UploadResult> => {
         const formData = new FormData();
         formData.append('file', file);
@@ -610,11 +631,10 @@ export const api = {
         return fetchJSON(`${API_BASE}/upload/daywise`, {
             method: 'POST',
             body: formData,
-            timeout: 600000, // 10 minutes - this file carries ESSL-sized row counts too
+            timeout: 600000,
         });
     },
 
-    // Reconciliation
     runReconciliation: async (target_date: string): Promise<any> => {
         const formData = new FormData();
         formData.append('target_date', target_date);
@@ -624,9 +644,6 @@ export const api = {
         });
     },
 
-    // ADDED: Tata_-_June.xlsx covers a full month across 30 sheets - reconciling one day at
-    // a time meant 30 manual clicks. This calls the new backend /reconciliation/run-month
-    // endpoint, which loops every day in the given month server-side.
     runReconciliationMonth: async (month: string): Promise<{
         status: string; month: string; days_processed: number;
         attendance_records_created: number; reconciliation_issues: number; hr_actions_created: number;
@@ -658,7 +675,6 @@ export const api = {
         return fetchJSON(`${API_BASE}/reconciliation/records?${params.toString()}`);
     },
 
-    // Dump Report
     getDumpReport: async (
         month?: string,
         vendor?: string,
@@ -686,7 +702,6 @@ export const api = {
     }): Promise<Blob> => {
         const query = new URLSearchParams();
         if (params.month) query.append('month', params.month);
-        // CRITICAL: convert camelCase to snake_case for backend
         if (params.targetDate) query.append('target_date', params.targetDate);
         if (params.vendor) query.append('vendor', params.vendor);
         if (params.store) query.append('store', params.store);
@@ -699,8 +714,6 @@ export const api = {
         return res.blob();
     },
 
-    // ADDED: Reports.tsx had UI for these three but nothing was implemented behind them -
-    // it just showed a fake success alert(). The backend now has real CSV endpoints for all three.
     downloadOtReport: async (month?: string, vendor?: string, store?: string): Promise<Blob> => {
         const params = new URLSearchParams();
         if (month) params.append('month', month);
@@ -726,7 +739,6 @@ export const api = {
         return res.blob();
     },
 
-    // Employee Summary
     getEmployeeSummary: async (pr_number: string, month?: string): Promise<EmployeeSummary> => {
         const url = month
             ? `${API_BASE}/employee/summary/${pr_number}?month=${month}`
@@ -734,7 +746,6 @@ export const api = {
         return fetchJSON(url);
     },
 
-    // Late Punch
     calculateLatePunch: async (pr_number: string, month: string): Promise<any> => {
         const formData = new FormData();
         formData.append('pr_number', pr_number);
@@ -751,14 +762,10 @@ export const api = {
         });
     },
 
-    // ADDED: matches the new backend /api/v1/data-quality/unmatched endpoint - surfaces
-    // ESSL/Tata rows that couldn't be linked to a Master employee (PayCode mismatch, etc.)
     getUnmatched: async (source: 'essl' | 'tata'): Promise<UnmatchedRecord[]> => {
         return fetchJSON(`${API_BASE}/data-quality/unmatched?source=${source}`);
     },
 
-    // ADDED: Predictive Analytics - matches the new /api/v1/analytics/* endpoints.
-    // Used by AIAnalytics.tsx for meeting-day planning and OT trend forecasting.
     getDayOfWeekAnalytics: async (
         monthsBack: number = 6,
         vendor?: string,

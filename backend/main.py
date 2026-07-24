@@ -58,6 +58,7 @@ import io as bio
 import os
 import re
 import hashlib
+import secrets
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc
@@ -73,19 +74,31 @@ from openpyxl import load_workbook
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-DATABASE_URL = f"sqlite:///{DATA_DIR}/seabird_hr.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
+# Neon / PostgreSQL connection
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./seabird_hr.db")
+
+# SQLAlchemy needs "postgresql://" not "postgres://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# SQLite-only args won't work with Postgres
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+    
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA cache_size=10000")
+        cursor.close()
+else:
+    engine = create_engine(DATABASE_URL)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_conn, connection_record):
-    cursor = dbapi_conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA synchronous=NORMAL")
-    cursor.execute("PRAGMA cache_size=10000")
-    cursor.close()
 Base = declarative_base()
-
 # ============================================================================
 # DATABASE MODELS
 # ============================================================================
@@ -309,6 +322,19 @@ class BehavioralAlert(Base):
     threshold_used = Column(Integer, default=3)
     calculated_at = Column(DateTime, default=datetime.utcnow)
 
+
+class User(Base):
+    """Minimal auth users table. In production, switch to bcrypt + JWT."""
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50), unique=True, index=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    role = Column(String(20), default="user")
+    is_active = Column(Boolean, default=True)
+    api_token = Column(String(255), unique=True, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 def _run_lightweight_migrations():
@@ -323,7 +349,9 @@ def _run_lightweight_migrations():
                     conn.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type}')
                     print(f"[MIGRATE] Added column {table.name}.{column.name}")
 
-_run_lightweight_migrations()
+if DATABASE_URL.startswith("sqlite"):
+    _run_lightweight_migrations()
+
 
 def get_db():
     db = SessionLocal()
@@ -331,6 +359,64 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# ============================================================================
+# AUTH HELPERS (zero-dependency: uses built-in hashlib + secrets)
+# ============================================================================
+
+def _hash_password(password: str) -> str:
+    """PBKDF2 hash — replace with passlib/bcrypt for production."""
+    salt = "seabird-hr-static-salt-v1"
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return secrets.compare_digest(_hash_password(plain), hashed)
+
+
+def _generate_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _seed_default_admin(db: Session):
+    """Create a default admin user if the users table is empty."""
+    if db.query(User).first() is None:
+        admin = User(
+            username="admin",
+            name="HR Manager",
+            hashed_password=_hash_password("admin123"),
+            role="admin",
+            api_token=_generate_token(),
+        )
+        db.add(admin)
+        db.commit()
+        print("[AUTH] Default admin created: username=admin, password=admin123")
+
+
+
+# Seed default admin user on first boot
+with SessionLocal() as _seed_db:
+    _seed_default_admin(_seed_db)
+from fastapi import Header
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+security = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+) -> User:
+    """Dependency to protect routes. Pass token in Authorization: Bearer <token> header."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    token = credentials.credentials
+    user = db.query(User).filter(User.api_token == token, User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
 
 app = FastAPI(
     title="SeaBird HR Analytics API",
@@ -4159,6 +4245,54 @@ def debug_employees_without_attendance(target_date: str = Query(...), db: Sessio
         "missing_employees": missing[:50],  # First 50
         "note": f"Showing first 50 of {len(missing)} missing employees"
     }
+
+# ============================================================================
+# AUTH ENDPOINTS
+# ============================================================================
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    token: str
+    user: Dict[str, Any]
+
+@app.post("/api/v1/auth/login", response_model=LoginResponse)
+def auth_login(req: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username).first()
+    if not user or not _verify_password(req.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account disabled")
+    # Rotate token on each login
+    user.api_token = _generate_token()
+    db.commit()
+    return {
+        "token": user.api_token,
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "username": user.username,
+            "role": user.role,
+        },
+    }
+
+@app.get("/api/v1/auth/me")
+def auth_me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "name": current_user.name,
+        "username": current_user.username,
+        "role": current_user.role,
+    }
+
+@app.post("/api/v1/auth/logout")
+def auth_logout(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    current_user.api_token = None
+    db.commit()
+    return {"status": "logged_out"}
+
 # ============================================================================
 # PREDICTIVE ANALYTICS ENDPOINTS
 # Uses the SAME "present" definition as /api/v1/kpis:
@@ -4380,7 +4514,18 @@ def get_ot_trend_forecast(
 @app.options("/{path:path}")
 async def preflight_handler(path: str):
     """Handle CORS preflight requests that bypass middleware."""
-    return {"status": "ok"}
+    from fastapi.responses import Response
+    return Response(
+        content="",
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": ", ".join(_origins) if len(_origins) > 1 else _origins[0],
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, Accept, Accept-Encoding, Authorization, X-Requested-With, X-CSRF-Token, Origin, Cache-Control, Pragma",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "600",
+        }
+    )
 
 # ============================================================================
 # RUN

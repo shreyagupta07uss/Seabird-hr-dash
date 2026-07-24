@@ -1,20 +1,23 @@
 import React, { useState, useEffect } from 'react';
-import { 
-    LayoutDashboard, Calendar, Users, Building2, Store, 
-    Briefcase, Clock, FileText, Upload, AlertCircle, 
+import {
+    LayoutDashboard, Calendar, Users, FileText, Upload, AlertCircle,
     Settings, ChevronLeft, Search, Bell, Menu, ChevronRight,
-    Zap, ArrowRightLeft, Sparkles, UserSearch
+    Zap, ArrowRightLeft, Sparkles, UserSearch, LogOut
 } from 'lucide-react';
-import Dashboard from './components/Dashboard.tsx';
-import Attendance from './components/Attendance.tsx';
-import Reconciliation from './components/Reconciliation.tsx';
-import Employees from './components/Employees.tsx';
-import UploadCenter from './components/UploadCenter.tsx';
-import HRActions from './components/HRActions.tsx';
-import Reports from './components/Reports.tsx';
-import AIAnalytics from './components/AIAnalytics.tsx';
-import EmployeeSummary from './components/EmployeeSummary.tsx';
-import { ToastContainer } from './components/SharedUI.tsx';
+import { useAuth } from './context/AuthContext';
+import { BrowserRouter } from "react-router-dom";
+import { AuthProvider } from './context/AuthContext';
+import LoginPage from './components/LoginPage';
+import Dashboard from './components/Dashboard';
+import Attendance from './components/Attendance';
+import Reconciliation from './components/Reconciliation';
+import Employees from './components/Employees';
+import UploadCenter from './components/UploadCenter';
+import HRActions from './components/HRActions';
+import Reports from './components/Reports';
+import AIAnalytics from './components/AIAnalytics';
+import EmployeeSummary from './components/EmployeeSummary';
+import { ToastContainer } from './components/SharedUI';
 
 type TabId = 'dashboard' | 'attendance' | 'reconciliation' | 'employees' | 'vendors' | 'stores' | 'departments' | 'shifts' | 'overtime' | 'reports' | 'upload' | 'actions' | 'settings' | 'aianalytics' | 'employee-summary';
 
@@ -40,6 +43,17 @@ const SIDEBAR_ITEMS: SidebarItem[] = [
 ];
 
 export default function App() {
+    return (
+        <AuthProvider>
+            <BrowserRouter>          {/* <-- ADD THIS */}
+                <AppContent />
+            </BrowserRouter>
+        </AuthProvider>
+    );
+}
+
+function AppContent() {
+    const { user, isAuthenticated, isLoading, logout } = useAuth();
     const [activeTab, setActiveTab] = useState<TabId>('dashboard');
     const [sidebarOpen, setSidebarOpen] = useState(true);
     const [searchQuery, setSearchQuery] = useState('');
@@ -50,7 +64,6 @@ export default function App() {
         const handleNavigate = (e: any) => {
             if (e.detail) {
                 setActiveTab(e.detail);
-                // FIX: If PR number is passed, store it for EmployeeSummary
                 if (e.pr_number) {
                     setEmployeeSummaryPR(e.pr_number);
                 }
@@ -69,6 +82,19 @@ export default function App() {
     const removeToast = (id: number) => {
         setToasts(prev => prev.filter(t => t.id !== id));
     };
+
+    // ── Show login screen if not authenticated ──
+    if (isLoading) {
+        return (
+            <div className="h-screen flex items-center justify-center bg-slate-50">
+                <div className="w-10 h-10 border-3 border-slate-200 border-t-blue-700 rounded-full animate-spin" />
+            </div>
+        );
+    }
+
+    if (!isAuthenticated) {
+        return <LoginPage />;
+    }
 
     const renderContent = () => {
         switch (activeTab) {
@@ -125,8 +151,8 @@ export default function App() {
                                         key={item.id}
                                         onClick={() => setActiveTab(item.id)}
                                         className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-                                            activeTab === item.id 
-                                                ? 'bg-blue-50 text-blue-700' 
+                                            activeTab === item.id
+                                                ? 'bg-blue-50 text-blue-700'
                                                 : 'text-slate-600 hover:bg-slate-50'
                                         }`}
                                     >
@@ -140,7 +166,7 @@ export default function App() {
                 </div>
 
                 <div className="p-3 border-t border-slate-100">
-                    <button 
+                    <button
                         onClick={() => setSidebarOpen(!sidebarOpen)}
                         className="w-full flex items-center justify-center p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-50 rounded-lg transition-colors"
                     >
@@ -157,8 +183,8 @@ export default function App() {
                         </button>
                         <div className="relative w-96">
                             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-                            <input 
-                                type="text" 
+                            <input
+                                type="text"
                                 placeholder="Search employees, PR, actions..."
                                 value={searchQuery}
                                 onChange={(e) => setSearchQuery(e.target.value)}
@@ -173,12 +199,21 @@ export default function App() {
                         </button>
                         <div className="flex items-center gap-3 pl-4 border-l border-slate-200">
                             <div className="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center">
-                                <span className="text-xs font-bold text-blue-700">HR</span>
+                                <span className="text-xs font-bold text-blue-700">
+                                    {user?.name?.charAt(0) || "U"}
+                                </span>
                             </div>
                             <div className="hidden md:block">
-                                <p className="text-sm font-medium text-slate-700">HR Manager</p>
-                                <p className="text-xs text-slate-400">hr_manager</p>
+                                <p className="text-sm font-medium text-slate-700">{user?.name || "User"}</p>
+                                <p className="text-xs text-slate-400">{user?.role || "hr_manager"}</p>
                             </div>
+                            <button
+                                onClick={logout}
+                                className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors ml-1"
+                                title="Logout"
+                            >
+                                <LogOut size={18} />
+                            </button>
                         </div>
                     </div>
                 </header>
