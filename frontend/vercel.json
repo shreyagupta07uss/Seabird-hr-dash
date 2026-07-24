@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "projects": [
+    {
+      "name": "seabird-hr-frontend",
+      "rootDirectory": "frontend",
+      "framework": "vite"
+    }
+  ]
+}
