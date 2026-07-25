@@ -426,14 +426,14 @@ app = FastAPI(
 
 # CORS - dynamically add deployed frontend
 SEABIRD_FRONTEND_URL = os.environ.get("SEABIRD_FRONTEND_URL", "")
+# CORS
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
+    "https://sea-bird-hr-ydgc.vercel.app",
 ]
-if SEABIRD_FRONTEND_URL:
-    _origins.append(SEABIRD_FRONTEND_URL)
 
 app.add_middleware(
     CORSMiddleware,
