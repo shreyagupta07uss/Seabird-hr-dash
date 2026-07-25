@@ -424,35 +424,23 @@ app = FastAPI(
     version="3.2.8-MERGED"
 )
 
-_frontend_url = os.environ.get("SEABIRD_FRONTEND_URL", "")
-if _frontend_url:
-    _origins = [_frontend_url]
-else:
-    _origins = [
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000",
-    ]
+# CORS - dynamically add deployed frontend
+SEABIRD_FRONTEND_URL = os.environ.get("SEABIRD_FRONTEND_URL", "")
+_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+]
+if SEABIRD_FRONTEND_URL:
+    _origins.append(SEABIRD_FRONTEND_URL)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=[
-        "Content-Type",
-        "Accept",
-        "Accept-Encoding",
-        "Authorization",
-        "X-Requested-With",
-        "X-CSRF-Token",
-        "Origin",
-        "Cache-Control",
-        "Pragma",
-    ],
-    expose_headers=["Content-Disposition", "X-Total-Count"],
-    max_age=600,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ============================================================================
