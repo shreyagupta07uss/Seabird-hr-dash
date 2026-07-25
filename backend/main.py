@@ -4496,24 +4496,7 @@ def get_ot_trend_forecast(
 
 
 # ============================================================================
-# CORS PREFLIGHT FALLBACK
-# ============================================================================
 
-@app.options("/{path:path}")
-async def preflight_handler(path: str):
-    """Handle CORS preflight requests that bypass middleware."""
-    from fastapi.responses import Response
-    return Response(
-        content="",
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": ", ".join(_origins) if len(_origins) > 1 else _origins[0],
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "Content-Type, Accept, Accept-Encoding, Authorization, X-Requested-With, X-CSRF-Token, Origin, Cache-Control, Pragma",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Max-Age": "600",
-        }
-    )
 
 # ============================================================================
 # RUN
