@@ -425,7 +425,7 @@ app = FastAPI(
 )
 
 # CORS - dynamically add deployed frontend
-# CORS - hardcoded origins to avoid env var issues in production
+# CORS - bulletproof config for production
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
@@ -442,7 +442,29 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
+
+# SAFETY NET: catch-all OPTIONS middleware (runs BEFORE route matching)
+# This guarantees preflight always returns 200 even if a rogue handler exists
+from starlette.responses import Response
+
+@app.middleware("http")
+async def options_safety_net(request, call_next):
+    if request.method == "OPTIONS":
+        origin = request.headers.get("origin", "*")
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": origin if origin != "*" else _origins[0],
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, X-Requested-With",
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+    return await call_next(request)
 
 # ============================================================================
 # BUSINESS RULES ENGINE
