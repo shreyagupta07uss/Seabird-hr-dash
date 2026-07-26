@@ -518,6 +518,12 @@ def safe_shift(shift: Optional[str]) -> str:
     s = normalize_shift(shift)
     return s[:10]
 
+def safe_time(time_val: Optional[str]) -> Optional[str]:
+    """Truncate time string to fit VARCHAR(10)."""
+    if not time_val:
+        return None
+    return time_val[:10]
+
 def parse_time_br(value) -> Optional[str]:
     if value is None:
         return None
@@ -540,7 +546,10 @@ def parse_time_br(value) -> Optional[str]:
             return datetime.strptime(time_str, fmt).strftime("%H:%M")
         except ValueError:
             continue
-    return time_str if ":" in time_str else None
+    # FIX: Don't return raw strings that look like time ranges (e.g. "15:00To23:30")
+    if ":" in time_str and len(time_str) <= 10:
+        return time_str[:10]
+    return None
 
 def parse_time_obj(value) -> Optional[time]:
     if value is None:
@@ -1734,8 +1743,8 @@ async def upload_essl(file: UploadFile = File(...), force: bool = Form(False), d
             emp_code = str(row.get("EMP Code", row.get("Emp Code", row.get("emp_code", "")))).strip()
             emp_name = str(row.get("EMP Name", row.get("Emp Name", row.get("name", "")))).strip()
             att_date = parse_date_br(row.get("Date", row.get("date", "")))
-            in_time = parse_time_br(row.get("IN", row.get("In", row.get("in_time", ""))))
-            out_time = parse_time_br(row.get("OUT", row.get("Out", row.get("out_time", ""))))
+            in_time = safe_time(parse_time_br(row.get("IN", row.get("In", row.get("in_time", "")))))
+            out_time = safe_time(parse_time_br(row.get("OUT", row.get("Out", row.get("out_time", "")))))
             raw_in = str(row.get("IN", row.get("In", row.get("in_time", "")))).strip()
             raw_out = str(row.get("OUT", row.get("Out", row.get("out_time", "")))).strip()
             essl_status = None
@@ -1790,7 +1799,7 @@ async def upload_essl(file: UploadFile = File(...), force: bool = Form(False), d
                     "status": essl_status,
                     "vendor": emp.vendor if emp else "",
                     "store": emp.store if emp else "",
-                    "shift": emp.shift if emp else "G",
+                    "shift": safe_shift(emp.shift) if emp else "G",
                 })
             processed += 1
 
@@ -1989,7 +1998,7 @@ async def upload_essl(file: UploadFile = File(...), force: bool = Form(False), d
                 "raw_punches": json.dumps(raw_punches) if raw_punches else None,
                 "vendor": emp.vendor if emp else "",
                 "store": emp.store if emp else "",
-                "shift": normalize_shift(shift),
+                "shift": safe_shift(shift),
             })
         processed += 1
 
@@ -2040,8 +2049,8 @@ async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), d
         paycode = str(row.get("PayCode", row.get("Pay Code", row.get("paycode", "")))).strip()
         emp_name = str(row.get("Employee Name", row.get("EMP Name", row.get("EmployeeName", "")))).strip()
         att_date = parse_date_br(row.get("Date", row.get("date", "")))
-        in_time = parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", ""))))
-        out_time = parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", ""))))
+        in_time = safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", "")))))
+        out_time = safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", "")))))
         man_hrs = float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0)
         status_val = str(row.get("Status", row.get("status", "P"))).strip().upper()
         dept_from_row = str(row.get("Department", row.get("department", ""))).strip()
@@ -2060,7 +2069,7 @@ async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), d
 
         row_shift_raw = row.get("Shift", row.get("Shift In Time", None))
         if row_shift_raw:
-            shift = normalize_shift(str(row_shift_raw))
+            shift = safe_shift(str(row_shift_raw))
         else:
             shift = emp.shift if emp else "G"
 
@@ -2072,8 +2081,9 @@ async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), d
             dept_val = dept_from_row or division_from_row
             if dept_val and emp.department != dept_val:
                 emp.department = dept_val
-            if shift and emp.shift != shift:
-                emp.shift = shift
+            safe_emp_shift = safe_shift(shift)
+            if safe_emp_shift and emp.shift != safe_emp_shift:
+                emp.shift = safe_emp_shift
 
         if status_val not in ["P", "A", "L", "HD", "WO", "SP"]:
             status_val = "P" if (in_time or out_time or man_hrs > 0) else "A"
@@ -2082,23 +2092,23 @@ async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), d
         ot_result = calculate_ot(shift, category, in_time, out_time, man_hrs)
 
         if existing_tata:
-            existing_tata.in_time = in_time or existing_tata.in_time
-            existing_tata.out_time = out_time or existing_tata.out_time
+            existing_tata.in_time = safe_time(in_time) or existing_tata.in_time
+            existing_tata.out_time = safe_time(out_time) or existing_tata.out_time
             existing_tata.man_hrs = man_hrs if man_hrs > 0 else existing_tata.man_hrs
             existing_tata.status = status_val
             existing_tata.ot_hours = ot_result["calculated_ot_hours"]
-            existing_tata.shift = shift
+            existing_tata.shift = safe_shift(shift)
             existing_tata.department = dept_from_row or division_from_row or existing_tata.department
         else:
             db.add(TataAttendance(
                 employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=emp_name,
-                date=att_date, in_time=in_time, out_time=out_time, man_hrs=man_hrs, status=status_val,
+                date=att_date, in_time=safe_time(in_time), out_time=safe_time(out_time), man_hrs=man_hrs, status=status_val,
                 ot_hours=ot_result["calculated_ot_hours"],
                 early_going=str(row.get("Early Going", "")).strip(), shift_late=str(row.get("Shift Late", "")).strip(),
                 vendor=normalize_vendor(str(row.get("Contractor", emp.vendor if emp else ""))),
                 store=str(row.get("Store", emp.store if emp else "")).strip(),
                 department=dept_from_row or division_from_row or (emp.department if emp else ""),
-                shift=shift
+                shift=safe_shift(shift)
             ))
         processed += 1
         if processed % 500 == 0:
@@ -2297,13 +2307,13 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
 
             existing_essl = db.query(ESSLAttendance).filter(ESSLAttendance.pr_number == prn, ESSLAttendance.date == resolved_date).first()
             if existing_essl:
-                existing_essl.in_time = in_time or existing_essl.in_time
-                existing_essl.out_time = out_time or existing_essl.out_time
-                existing_essl.status = essl_status or existing_essl.status
+                existing_essl.in_time = safe_time(in_time) or existing_essl.in_time
+                existing_essl.out_time = safe_time(out_time) or existing_essl.out_time
+                existing_essl.status = safe_shift(essl_status) or existing_essl.status
             else:
                 db.add(ESSLAttendance(
                     employee_id=emp.id if emp else None, pr_number=prn, emp_code=prn, emp_name=name_val,
-                    date=resolved_date, in_time=in_time, out_time=out_time, status=essl_status,
+                    date=resolved_date, in_time=safe_time(in_time), out_time=safe_time(out_time), status=safe_shift(essl_status) if essl_status else None,
                     vendor=emp.vendor if emp else "", store=emp.store if emp else "", shift=safe_shift(emp.shift) if emp else "G"
                 ))
             essl_processed += 1
@@ -2317,8 +2327,8 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
         paycode = str(row.get("PayCode", row.get("Pay Code", ""))).strip()
         emp_name = str(row.get("Employee Name", row.get("EMP Name", ""))).strip()
         att_date = parse_date_br(row.get("Date", row.get("date", ""))) or resolved_date
-        in_time = parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", ""))))
-        out_time = parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", ""))))
+        in_time = safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", "")))))
+        out_time = safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", "")))))
         man_hrs = float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0)
         status_val = str(row.get("Status", row.get("status", "P"))).strip().upper()
         dept_from_row = str(row.get("Department", row.get("department", ""))).strip()
@@ -2331,7 +2341,7 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
         pr_number = emp.pr_number if emp else paycode
 
         row_shift_raw = row.get("Shift", row.get("Shift In Time", None))
-        shift = normalize_shift(str(row_shift_raw)) if row_shift_raw else (safe_shift(emp.shift) if emp else "G")
+        shift = safe_shift(str(row_shift_raw)) if row_shift_raw else (safe_shift(emp.shift) if emp else "G")
         category = normalize_category(str(row.get("WC/BC", ""))).strip() or (emp.wc if emp else "BC")
         if category == "":
             category = emp.wc if emp else "BC"
@@ -2340,8 +2350,9 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
             dept_val = dept_from_row or division_from_row
             if dept_val and emp.department != dept_val:
                 emp.department = dept_val
-            if shift and emp.shift != shift:
-                emp.shift = shift
+            safe_emp_shift = safe_shift(shift)
+            if safe_emp_shift and emp.shift != safe_emp_shift:
+                emp.shift = safe_emp_shift
 
         if status_val not in ["P", "A", "L", "HD", "WO", "SP"]:
             status_val = "P" if (in_time or out_time or man_hrs > 0) else "A"
@@ -2350,29 +2361,45 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
         ot_result = calculate_ot(shift, category, in_time, out_time, man_hrs)
 
         if existing_tata:
-            existing_tata.in_time = in_time or existing_tata.in_time
-            existing_tata.out_time = out_time or existing_tata.out_time
+            existing_tata.in_time = safe_time(in_time) or existing_tata.in_time
+            existing_tata.out_time = safe_time(out_time) or existing_tata.out_time
             existing_tata.man_hrs = man_hrs if man_hrs > 0 else existing_tata.man_hrs
             existing_tata.status = status_val
             existing_tata.ot_hours = ot_result["calculated_ot_hours"]
-            existing_tata.shift = shift
+            existing_tata.shift = safe_shift(shift)
             existing_tata.department = dept_from_row or division_from_row or existing_tata.department
         else:
             db.add(TataAttendance(
                 employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=emp_name,
-                date=att_date, in_time=in_time, out_time=out_time, man_hrs=man_hrs, status=status_val,
+                date=att_date, in_time=safe_time(in_time), out_time=safe_time(out_time), man_hrs=man_hrs, status=status_val,
                 ot_hours=ot_result["calculated_ot_hours"],
                 early_going=str(row.get("Early Going", "")).strip(), shift_late=str(row.get("Shift Late", "")).strip(),
                 vendor=normalize_vendor(str(row.get("Contractor", emp.vendor if emp else ""))),
                 store=str(row.get("Store", emp.store if emp else "")).strip(),
                 department=dept_from_row or division_from_row or (emp.department if emp else ""),
-                shift=shift
+                shift=safe_shift(shift)
             ))
         tata_processed += 1
         if tata_processed % 500 == 0:
             db.commit()
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception as commit_err:
+        db.rollback()
+        import traceback
+        err_detail = traceback.format_exc()
+        # Log what we were trying to insert for debugging
+        print(f"[DAYWISE COMMIT ERROR] {commit_err}")
+        print(f"[DAYWISE COMMIT ERROR] resolved_date={resolved_date}, essl_processed={essl_processed}, tata_processed={tata_processed}")
+        # Check for long strings in pending objects
+        for obj in db.new:
+            if hasattr(obj, '__tablename__'):
+                for col in obj.__table__.columns:
+                    val = getattr(obj, col.name, None)
+                    if val and isinstance(val, str) and len(val) > 50:
+                        print(f"[DAYWISE LONG STRING] {obj.__tablename__}.{col.name} = {val[:100]}...")
+        raise HTTPException(status_code=500, detail=f"Database commit failed: {str(commit_err)}")
     wb.close()
 
     db.add(UploadLog(file_type="daywise", filename=file.filename, file_hash=file_hash,
