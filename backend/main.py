@@ -425,14 +425,15 @@ app = FastAPI(
 )
 
 # CORS - dynamically add deployed frontend
-SEABIRD_FRONTEND_URL = os.environ.get("SEABIRD_FRONTEND_URL", "")
-# CORS
+# CORS - hardcoded origins to avoid env var issues in production
 _origins = [
     "http://localhost:5173",
     "http://localhost:3000",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
     "https://sea-bird-hr-ydgc.vercel.app",
+    "https://seabird-hr-dash.vercel.app",
+    "https://seabird-hr-dash-production.up.railway.app",
 ]
 
 app.add_middleware(
@@ -468,6 +469,10 @@ LATE_PUNCH_RULES = {"grace_minutes": 5, "half_day_after": 3, "one_day_after": 6}
 # code change via the `consecutive_days` query param on the calculate endpoint below;
 # this is just the default.
 BEHAVIORAL_ALERT_CONFIG = {"default_consecutive_days": 3}
+
+# OT Threshold Alerts
+OT_WEEKLY_THRESHOLD = 12.0   # hours per rolling 7-day window
+OT_MONTHLY_THRESHOLD = 48.0  # hours per calendar month
 
 ACTIVE_STATUS = {"ACTIVE", "OK", "ON LEAVE", "TRANSFER"}
 INACTIVE_STATUS = {"LEFT", "NOT OK", "RESIGNED", "TERMINATED"}
@@ -759,6 +764,89 @@ def calculate_late_punch_penalty(late_punch_count: int) -> Dict[str, Any]:
     label = "Half Day" if penalty_days == 0.5 else ("One Day" if penalty_days == 1.0 else f"{penalty_days} Days")
     return {"penalty_days": penalty_days, "penalty": label, "action_required": True,
             "next_penalty_at": next_threshold}
+
+
+def get_ot_totals(pr_number: str, reference_date: date, db: Session) -> tuple[float, float]:
+    """Return (weekly_ot, monthly_ot) for an employee relative to reference_date.
+    Weekly = rolling 7 days ending on reference_date.
+    Monthly = current calendar month."""
+    week_start = reference_date - timedelta(days=6)
+    month_start = date(reference_date.year, reference_date.month, 1)
+    month_end = date(reference_date.year, reference_date.month + 1, 1) if reference_date.month < 12 else date(reference_date.year + 1, 1, 1)
+
+    weekly_ot = db.query(func.sum(Overtime.ot_hours)).filter(
+        Overtime.pr_number == pr_number,
+        Overtime.date >= week_start,
+        Overtime.date <= reference_date
+    ).scalar() or 0.0
+
+    monthly_ot = db.query(func.sum(Overtime.ot_hours)).filter(
+        Overtime.pr_number == pr_number,
+        Overtime.date >= month_start,
+        Overtime.date < month_end
+    ).scalar() or 0.0
+
+    return round(float(weekly_ot), 2), round(float(monthly_ot), 2)
+
+
+def check_ot_thresholds(pr_number: str, emp_name: str, reference_date: date, db: Session) -> List[Dict[str, Any]]:
+    """Check if employee OT exceeds weekly (12h) or monthly (48h) thresholds.
+    Creates HRAction alerts if breached and not already flagged."""
+    weekly_ot, monthly_ot = get_ot_totals(pr_number, reference_date, db)
+    alerts: List[Dict[str, Any]] = []
+
+    # Weekly threshold check
+    if weekly_ot > OT_WEEKLY_THRESHOLD:
+        week_start = reference_date - timedelta(days=6)
+        existing = db.query(HRAction).filter(
+            HRAction.pr_number == pr_number,
+            HRAction.date >= week_start,
+            HRAction.date <= reference_date,
+            HRAction.action_type == "OT Weekly Threshold"
+        ).first()
+        if not existing:
+            db.add(HRAction(
+                pr_number=pr_number,
+                emp_name=emp_name,
+                date=reference_date,
+                action_type="OT Weekly Threshold",
+                description=(
+                    f"{emp_name} ({pr_number}) has exceeded the weekly OT limit: "
+                    f"{weekly_ot}h / {OT_WEEKLY_THRESHOLD}h "
+                    f"(week ending {reference_date.isoformat()})"
+                ),
+                priority="High",
+                assigned_to="HR Manager"
+            ))
+            alerts.append({"type": "weekly", "hours": weekly_ot, "threshold": OT_WEEKLY_THRESHOLD})
+
+    # Monthly threshold check
+    if monthly_ot > OT_MONTHLY_THRESHOLD:
+        month_start = date(reference_date.year, reference_date.month, 1)
+        month_end = date(reference_date.year, reference_date.month + 1, 1) if reference_date.month < 12 else date(reference_date.year + 1, 1, 1)
+        existing = db.query(HRAction).filter(
+            HRAction.pr_number == pr_number,
+            HRAction.date >= month_start,
+            HRAction.date < month_end,
+            HRAction.action_type == "OT Monthly Threshold"
+        ).first()
+        if not existing:
+            db.add(HRAction(
+                pr_number=pr_number,
+                emp_name=emp_name,
+                date=reference_date,
+                action_type="OT Monthly Threshold",
+                description=(
+                    f"{emp_name} ({pr_number}) has exceeded the monthly OT limit: "
+                    f"{monthly_ot}h / {OT_MONTHLY_THRESHOLD}h "
+                    f"for {reference_date.strftime('%Y-%m')}"
+                ),
+                priority="Critical",
+                assigned_to="HR Manager"
+            ))
+            alerts.append({"type": "monthly", "hours": monthly_ot, "threshold": OT_MONTHLY_THRESHOLD})
+
+    return alerts
 
 def _find_max_consecutive_streak(rows: List["Attendance"], flag_fn) -> Dict[str, Any]:
     """Given Attendance rows sorted by date ascending, find the longest run of
@@ -2683,6 +2771,8 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
                     ot_hours=ot_hours, calc_headcount=ot_headcount, status="Pending"
                 ))
                 hr_actions_created += 1
+            # Check OT thresholds whenever an OT record exists for this day
+            check_ot_thresholds(emp.pr_number, emp.name, d, db)
 
     db.commit()
     return {
@@ -2710,6 +2800,7 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
     employees = db.query(Employee).all()
     emp_ids = [e.id for e in employees]
     emp_by_id = {e.id: e for e in employees}
+    emp_by_pr = {e.pr_number: e for e in employees if e.pr_number}
     pr_numbers = [e.pr_number for e in employees]
 
     # FIX v3.2: Pre-fetch ALL data for the ENTIRE month in 5 bulk queries
@@ -3129,6 +3220,19 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
 
     db.commit()
 
+    # Post-process: Check OT thresholds for any employee who accrued OT this month
+    ot_employees = db.query(Overtime.pr_number, Overtime.date).filter(
+        Overtime.date >= start,
+        Overtime.date < end,
+        Overtime.ot_hours > 0
+    ).distinct().all()
+    for pr, dt in ot_employees:
+        emp = emp_by_pr.get(pr)
+        if emp:
+            check_ot_thresholds(pr, emp.name, dt, db)
+    if ot_employees:
+        db.commit()
+
     return {
         "status": "completed",
         "month": month,
@@ -3468,6 +3572,124 @@ def get_alerts_summary(month: str = Query(...), db: Session = Depends(get_db)):
         "half_day_streak_alerts": half_day,
         "total_alerts": penalized + early_dep + half_day
     }
+
+# ============================================================================
+# OT THRESHOLD ALERTS
+# ============================================================================
+
+@app.post("/api/v1/alerts/ot-thresholds/calculate")
+def calculate_ot_threshold_alerts(
+    month: str = Query(..., description="YYYY-MM format"),
+    db: Session = Depends(get_db)
+):
+    """Batch-calculate OT threshold alerts for a given month.
+    Scans all OT records and creates HRAction alerts where weekly > 12h or monthly > 48h."""
+    year, mon = parse_year_month(month)
+    start = date(year, mon, 1)
+    end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+
+    ot_records = db.query(Overtime).filter(
+        Overtime.date >= start,
+        Overtime.date < end,
+        Overtime.ot_hours > 0
+    ).order_by(Overtime.pr_number, Overtime.date).all()
+
+    alerts_created = []
+    checked_keys = set()
+
+    for ot in ot_records:
+        key = (ot.pr_number, ot.date)
+        if key in checked_keys:
+            continue
+        checked_keys.add(key)
+
+        emp = db.query(Employee).filter(Employee.pr_number == ot.pr_number).first()
+        if emp:
+            alerts = check_ot_thresholds(ot.pr_number, emp.name, ot.date, db)
+            if alerts:
+                alerts_created.append({
+                    "pr_number": ot.pr_number,
+                    "name": emp.name,
+                    "date": ot.date.isoformat(),
+                    "alerts": alerts
+                })
+
+    db.commit()
+    return {
+        "status": "completed",
+        "month": month,
+        "alerts_created": len(alerts_created),
+        "details": alerts_created
+    }
+
+
+@app.get("/api/v1/alerts/ot-thresholds")
+def get_ot_threshold_alerts(
+    month: str = Query(..., description="YYYY-MM format"),
+    db: Session = Depends(get_db)
+):
+    """List all open OT threshold alerts for the month."""
+    year, mon = parse_year_month(month)
+    start = date(year, mon, 1)
+    end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+
+    actions = db.query(HRAction).filter(
+        HRAction.date >= start,
+        HRAction.date < end,
+        HRAction.action_type.in_(["OT Weekly Threshold", "OT Monthly Threshold"]),
+        HRAction.status == "Open"
+    ).order_by(desc(HRAction.created_at)).all()
+
+    return {
+        "month": month,
+        "total": len(actions),
+        "data": [
+            {
+                "id": a.id,
+                "pr_number": a.pr_number,
+                "name": a.emp_name,
+                "date": a.date.isoformat(),
+                "action_type": a.action_type,
+                "description": a.description,
+                "priority": a.priority,
+                "status": a.status
+            }
+            for a in actions
+        ]
+    }
+
+
+@app.get("/api/v1/alerts/ot-thresholds/summary")
+def get_ot_threshold_summary(
+    month: str = Query(..., description="YYYY-MM format"),
+    db: Session = Depends(get_db)
+):
+    """Dashboard tile: count of weekly and monthly OT threshold breaches."""
+    year, mon = parse_year_month(month)
+    start = date(year, mon, 1)
+    end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+
+    weekly = db.query(HRAction).filter(
+        HRAction.date >= start,
+        HRAction.date < end,
+        HRAction.action_type == "OT Weekly Threshold",
+        HRAction.status == "Open"
+    ).count()
+
+    monthly = db.query(HRAction).filter(
+        HRAction.date >= start,
+        HRAction.date < end,
+        HRAction.action_type == "OT Monthly Threshold",
+        HRAction.status == "Open"
+    ).count()
+
+    return {
+        "month": month,
+        "weekly_breaches": weekly,
+        "monthly_breaches": monthly,
+        "total_breaches": weekly + monthly
+    }
+
 
 # ============================================================================
 # DUMP REPORT
