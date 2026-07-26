@@ -425,46 +425,34 @@ app = FastAPI(
 )
 
 # CORS - dynamically add deployed frontend
-# CORS - bulletproof config for production
-_origins = [
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:3000",
-    "https://sea-bird-hr-ydgc.vercel.app",
-    "https://seabird-hr-dash.vercel.app",
-    "https://seabird-hr-dash-production.up.railway.app",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=86400,
-)
-
-# SAFETY NET: catch-all OPTIONS middleware (runs BEFORE route matching)
-# This guarantees preflight always returns 200 even if a rogue handler exists
+# CORS - DYNAMIC: reflect any origin (internal tool - no hardcoded URLs needed)
+# This eliminates all CORS issues regardless of which Vercel/Railway URL is used
 from starlette.responses import Response
 
 @app.middleware("http")
-async def options_safety_net(request, call_next):
+async def dynamic_cors_middleware(request, call_next):
+    """Handle CORS for ALL origins dynamically. Internal tool - no URL whitelist needed."""
+    origin = request.headers.get("origin", "*")
+
+    # Handle preflight (OPTIONS) immediately
     if request.method == "OPTIONS":
-        origin = request.headers.get("origin", "*")
         return Response(
             status_code=200,
             headers={
-                "Access-Control-Allow-Origin": origin if origin != "*" else _origins[0],
+                "Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, X-Requested-With",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, X-Requested-With, Origin",
                 "Access-Control-Allow-Credentials": "true",
                 "Access-Control-Max-Age": "86400",
             },
         )
-    return await call_next(request)
+
+    # Handle actual request
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Expose-Headers"] = "*"
+    return response
 
 # ============================================================================
 # BUSINESS RULES ENGINE
