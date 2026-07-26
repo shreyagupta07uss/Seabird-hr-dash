@@ -513,6 +513,11 @@ def normalize_shift(shift: Optional[str]) -> str:
         return "G"
     return shift
 
+def safe_shift(shift: Optional[str]) -> str:
+    """Normalize shift and guarantee it fits in VARCHAR(10)."""
+    s = normalize_shift(shift)
+    return s[:10]
+
 def parse_time_br(value) -> Optional[str]:
     if value is None:
         return None
@@ -2299,7 +2304,7 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
                 db.add(ESSLAttendance(
                     employee_id=emp.id if emp else None, pr_number=prn, emp_code=prn, emp_name=name_val,
                     date=resolved_date, in_time=in_time, out_time=out_time, status=essl_status,
-                    vendor=emp.vendor if emp else "", store=emp.store if emp else "", shift=emp.shift if emp else "G"
+                    vendor=emp.vendor if emp else "", store=emp.store if emp else "", shift=safe_shift(emp.shift) if emp else "G"
                 ))
             essl_processed += 1
             if essl_processed % 500 == 0:
@@ -2326,7 +2331,7 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
         pr_number = emp.pr_number if emp else paycode
 
         row_shift_raw = row.get("Shift", row.get("Shift In Time", None))
-        shift = normalize_shift(str(row_shift_raw)) if row_shift_raw else (emp.shift if emp else "G")
+        shift = normalize_shift(str(row_shift_raw)) if row_shift_raw else (safe_shift(emp.shift) if emp else "G")
         category = normalize_category(str(row.get("WC/BC", ""))).strip() or (emp.wc if emp else "BC")
         if category == "":
             category = emp.wc if emp else "BC"
@@ -2482,7 +2487,7 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
 
         # FIX v3.2.8: If employee has NO ESSL and NO Tata data, create "Absent" record with issue "No Data"
         if not essl and not tata:
-            shift = normalize_shift(emp.shift) if emp.shift else "G"
+            shift = safe_shift(emp.shift) if emp.shift else "G"
             category = emp.wc or "BC"
             display_status = "Absent"
             issue = "No Data"
@@ -2537,9 +2542,9 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
             shift = None
         elif not has_any_punches:
             # Regular absent: use assigned shift from master
-            shift = normalize_shift(emp.shift) if emp.shift else "G"
+            shift = safe_shift(emp.shift) if emp.shift else "G"
         else:
-            shift = (tata.shift if tata and tata.shift else None) or (essl.shift if essl and essl.shift else None) or normalize_shift(emp.shift) or "G"
+            shift = safe_shift((tata.shift if tata and tata.shift else None) or (essl.shift if essl and essl.shift else None) or emp.shift) or "G"
         category = emp.wc or "BC"
         match_status = "Matched"
         match_delta_in = 0
@@ -2918,7 +2923,7 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
 
             # FIX v3.2.8: If employee has NO ESSL and NO Tata data, create "Absent" record
             if not essl and not tata:
-                shift = normalize_shift(emp.shift) if emp.shift else "G"
+                shift = safe_shift(emp.shift) if emp.shift else "G"
                 category = emp.wc or "BC"
                 display_status = "Absent"
                 issue = "No Data"
@@ -2974,9 +2979,9 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
                 shift = None
             elif not has_any_punches:
                 # Regular absent: use assigned shift from master
-                shift = normalize_shift(emp.shift) if emp.shift else "G"
+                shift = safe_shift(emp.shift) if emp.shift else "G"
             else:
-                shift = (tata.shift if tata and tata.shift else None) or (essl.shift if essl and essl.shift else None) or normalize_shift(emp.shift) or "G"
+                shift = safe_shift((tata.shift if tata and tata.shift else None) or (essl.shift if essl and essl.shift else None) or emp.shift) or "G"
             category = emp.wc or "BC"
 
             has_essl = bool(essl_in or essl_out or essl_status)
