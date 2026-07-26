@@ -94,7 +94,16 @@ if DATABASE_URL.startswith("sqlite"):
         cursor.execute("PRAGMA cache_size=10000")
         cursor.close()
 else:
-    engine = create_engine(DATABASE_URL)
+    # Neon / PostgreSQL: aggressive pool settings to prevent SSL drops
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,      # verify connection before use
+        pool_recycle=300,        # recycle every 5 min (Neon drops idle >5min)
+        pool_size=3,             # Neon free tier = 10 max concurrent
+        max_overflow=2,          # allow 2 extra temporarily
+        pool_timeout=30,         # wait up to 30s for a connection
+        connect_args={"sslmode": "require"} if "sslmode" not in DATABASE_URL else {}
+    )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -446,8 +455,14 @@ async def dynamic_cors_middleware(request, call_next):
             },
         )
 
-    # Handle actual request
-    response = await call_next(request)
+    # Handle actual request - add CORS headers even if the endpoint crashes
+    try:
+        response = await call_next(request)
+    except Exception:
+        # If the endpoint crashed (e.g. DB connection drop), create a 500 response
+        # with CORS headers so the browser doesn't blame CORS
+        response = Response(status_code=500, content="Internal Server Error")
+
     response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Expose-Headers"] = "*"
