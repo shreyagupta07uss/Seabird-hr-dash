@@ -424,7 +424,6 @@ app = FastAPI(
     version="3.2.8-MERGED"
 )
 
-# CORS - dynamically add deployed frontend
 # CORS - DYNAMIC: reflect any origin (internal tool - no hardcoded URLs needed)
 # This eliminates all CORS issues regardless of which Vercel/Railway URL is used
 from starlette.responses import Response
@@ -453,6 +452,17 @@ async def dynamic_cors_middleware(request, call_next):
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Expose-Headers"] = "*"
     return response
+
+# ============================================================================
+# HEALTH / CORS TEST
+# ============================================================================
+
+@app.get("/api/v1/health")
+def health_check():
+    """Returns ok. Use this to verify backend is alive and CORS headers are present."""
+    return {"status": "ok", "version": "3.2.10-OT", "timestamp": datetime.utcnow().isoformat()}
+
+
 
 # ============================================================================
 # BUSINESS RULES ENGINE
