@@ -650,17 +650,59 @@ export const api = {
         });
     },
 
-    runReconciliationMonth: async (month: string): Promise<{
+    // Reconciliation for a full month now runs as a background job on the server,
+    // because Railway's public-network edge proxy enforces a hard 5-minute cap on
+    // every HTTP request that can't be raised from either side - a big month can
+    // legitimately take longer than that. This starts the job, then polls for
+    // completion, so no single request is ever left open long enough to hit it.
+    //
+    // onProgress (optional) is called with "running" on every poll, so the UI can
+    // show a spinner/status message instead of looking frozen for a couple minutes.
+    runReconciliationMonth: async (
+        month: string,
+        onProgress?: (status: string) => void
+    ): Promise<{
         status: string; month: string; days_processed: number;
         attendance_records_created: number; reconciliation_issues: number; hr_actions_created: number;
     }> => {
         const formData = new FormData();
         formData.append('month', month);
-        return fetchJSON(`${API_BASE}/reconciliation/run-month`, {
-            method: 'POST',
-            body: formData,
-            timeout: 600000, // was hitting the 300s default on a full month's data
-        });
+
+        const { job_id } = await fetchJSON<{ status: string; job_id: string; month: string }>(
+            `${API_BASE}/reconciliation/run-month`,
+            { method: 'POST', body: formData }
+        );
+
+        const POLL_INTERVAL_MS = 3000;
+        const MAX_WAIT_MS = 20 * 60 * 1000; // 20 min hard client-side ceiling
+        const startedAt = Date.now();
+
+        while (true) {
+            if (Date.now() - startedAt > MAX_WAIT_MS) {
+                throw new Error(
+                    `Reconciliation is still running after ${Math.round(MAX_WAIT_MS / 60000)} minutes. ` +
+                    `It hasn't failed - check back later or refresh, job_id: ${job_id}`
+                );
+            }
+
+            await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+
+            const job = await fetchJSON<{
+                status: 'running' | 'completed' | 'failed';
+                result: any;
+                error: string | null;
+            }>(`${API_BASE}/reconciliation/run-month/${job_id}`);
+
+            if (job.status === 'running') {
+                onProgress?.('running');
+                continue;
+            }
+            if (job.status === 'failed') {
+                throw new Error(job.error || 'Reconciliation failed on the server.');
+            }
+            // completed
+            return job.result;
+        }
     },
 
     getReconciliationSummary: async (target_date?: string): Promise<ReconciliationSummary> => {
