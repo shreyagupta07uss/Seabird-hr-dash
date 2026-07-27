@@ -582,6 +582,12 @@ export const api = {
         return fetchJSON(`${API_BASE}/upload/history`);
     },
 
+    deleteUpload: async (id: number): Promise<{ status: string; id: number }> => {
+        return fetchJSON(`${API_BASE}/upload/${id}`, {
+            method: 'DELETE'
+        });
+    },
+
     uploadMaster: async (file: File, force: boolean = false): Promise<UploadResult> => {
         const formData = new FormData();
         formData.append('file', file);

@@ -1617,6 +1617,25 @@ def get_upload_history(db: Session = Depends(get_db)):
     return [{"id": l.id, "type": l.file_type, "filename": l.filename, "rows_processed": l.rows_processed,
              "status": l.status, "uploaded_at": l.uploaded_at.isoformat()} for l in logs]
 
+@app.delete("/api/v1/upload/{upload_id}")
+def delete_upload(upload_id: int, db: Session = Depends(get_db)):
+    """Removes an entry from Upload History and clears its file_hash so the same file
+    can be re-uploaded without being blocked as a duplicate.
+
+    NOTE: this does NOT delete the attendance rows that upload created - the data
+    tables (TataAttendance, ESSLAttendance, etc.) don't currently track which upload
+    each row came from, so there's no reliable way to know which rows to remove without
+    re-processing the original file. If you need "undo this upload's data" as well,
+    that needs a schema change (an upload_log_id column on each attendance table) - say
+    the word and it can be added.
+    """
+    log = db.query(UploadLog).filter(UploadLog.id == upload_id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    db.delete(log)
+    db.commit()
+    return {"status": "deleted", "id": upload_id}
+
 @app.post("/api/v1/upload/master")
 def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
     # NOTE: sync `def` (not async) so Starlette runs this in a worker thread instead of
@@ -3365,18 +3384,78 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
 
     db.commit()
 
-    # Post-process: Check OT thresholds for any employee who accrued OT this month
-    ot_employees = db.query(Overtime.pr_number, Overtime.date).filter(
-        Overtime.date >= start,
-        Overtime.date < end,
-        Overtime.ot_hours > 0
-    ).distinct().all()
-    for pr, dt in ot_employees:
-        emp = emp_by_pr.get(pr)
-        if emp:
-            check_ot_thresholds(pr, emp.name, dt, db)
-    if ot_employees:
-        db.commit()
+    # Post-process: Check OT thresholds for employees who accrued OT this month.
+    # FIX: this used to call check_ot_thresholds() - 2 SUM queries + up to 2 existence
+    # queries - once per employee PER DAY that had OT. For a full month with many
+    # employees on OT, that was easily thousands of extra round-trips and was the
+    # main reason reconciliation felt slow. Now it's computed once from data already
+    # in memory, plus 2 bulk existence queries total.
+    month_ot_by_pr: Dict[str, List[tuple]] = {}
+    for o in all_ot:  # existing Overtime rows for the month (already fetched above)
+        if o.ot_hours and o.ot_hours > 0:
+            month_ot_by_pr.setdefault(o.pr_number, []).append((o.date, o.ot_hours))
+    for o in ot_to_insert:  # newly created this run
+        if o.ot_hours and o.ot_hours > 0:
+            month_ot_by_pr.setdefault(o.pr_number, []).append((o.date, o.ot_hours))
+
+    if month_ot_by_pr:
+        prs_with_ot = list(month_ot_by_pr.keys())
+        existing_weekly = db.query(HRAction.pr_number, HRAction.date).filter(
+            HRAction.pr_number.in_(prs_with_ot),
+            HRAction.action_type == "OT Weekly Threshold",
+            HRAction.date >= start - timedelta(days=6), HRAction.date < end
+        ).all()
+        weekly_flagged_dates: Dict[str, List[date]] = {}
+        for pr, dt in existing_weekly:
+            weekly_flagged_dates.setdefault(pr, []).append(dt)
+
+        existing_monthly_prs = {
+            pr for (pr,) in db.query(HRAction.pr_number).filter(
+                HRAction.pr_number.in_(prs_with_ot),
+                HRAction.action_type == "OT Monthly Threshold",
+                HRAction.date >= start, HRAction.date < end
+            ).distinct().all()
+        }
+
+        threshold_actions_to_insert = []
+        for pr, entries in month_ot_by_pr.items():
+            emp = emp_by_pr.get(pr)
+            if not emp:
+                continue
+            entries.sort(key=lambda x: x[0])
+            already_flagged = weekly_flagged_dates.get(pr, [])
+            weekly_alert_added = False
+
+            for d_i, _ in entries:
+                week_start_i = d_i - timedelta(days=6)
+                weekly_sum = round(sum(h for dd, h in entries if week_start_i <= dd <= d_i), 2)
+                if weekly_sum > OT_WEEKLY_THRESHOLD and not weekly_alert_added:
+                    if not any(week_start_i <= fd <= d_i for fd in already_flagged):
+                        threshold_actions_to_insert.append(HRAction(
+                            pr_number=pr, emp_name=emp.name, date=d_i,
+                            action_type="OT Weekly Threshold",
+                            description=(f"{emp.name} ({pr}) has exceeded the weekly OT limit: "
+                                         f"{weekly_sum}h / {OT_WEEKLY_THRESHOLD}h (week ending {d_i.isoformat()})"),
+                            priority="High", assigned_to="HR Manager"
+                        ))
+                        weekly_alert_added = True
+                        totals["hr_actions_created"] += 1
+
+            monthly_sum = round(sum(h for _, h in entries), 2)
+            if monthly_sum > OT_MONTHLY_THRESHOLD and pr not in existing_monthly_prs:
+                last_date = entries[-1][0]
+                threshold_actions_to_insert.append(HRAction(
+                    pr_number=pr, emp_name=emp.name, date=last_date,
+                    action_type="OT Monthly Threshold",
+                    description=(f"{emp.name} ({pr}) has exceeded the monthly OT limit: "
+                                 f"{monthly_sum}h / {OT_MONTHLY_THRESHOLD}h"),
+                    priority="High", assigned_to="HR Manager"
+                ))
+                totals["hr_actions_created"] += 1
+
+        if threshold_actions_to_insert:
+            db.bulk_save_objects(threshold_actions_to_insert)
+            db.commit()
 
     return {
         "status": "completed",

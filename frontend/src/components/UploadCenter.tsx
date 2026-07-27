@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, FileUp, CheckCircle2, XCircle, FileText, Database, Table, AlertTriangle, CalendarDays } from 'lucide-react';
+import { Upload, FileUp, CheckCircle2, XCircle, FileText, Database, Table, AlertTriangle, CalendarDays, Trash2 } from 'lucide-react';
 import { api, UploadLog, UploadResult } from '../services/api';
 import { SectionHeader, LoadingSpinner, ErrorState, StatusBadge, Card, Button } from './SharedUI';
 
@@ -80,6 +80,7 @@ export default function UploadCenter() {
     // FIX: the result of the most recent upload is now shown in the UI with row/sheet counts,
     // instead of a generic "uploaded successfully!" alert that hid whether all sheets were read.
     const [lastResult, setLastResult] = useState<UploadResult | null>(null);
+    const [deletingId, setDeletingId] = useState<number | null>(null);
 
     const loadHistory = async () => {
         try {
@@ -116,6 +117,25 @@ export default function UploadCenter() {
             alert(`Upload failed: ${err.message}`);
         } finally {
             setUploadingType(null);
+        }
+    };
+
+    const handleDelete = async (id: number, filename: string) => {
+        // Destructive action - confirm first. Note: this only removes the log entry
+        // (and lets the same file be re-uploaded) - it does not undo the attendance
+        // rows that upload created.
+        const confirmed = window.confirm(
+            `Remove "${filename}" from upload history?\n\nThis clears it from the history list and allows re-uploading the same file. It does NOT remove the attendance data that was already imported.`
+        );
+        if (!confirmed) return;
+        try {
+            setDeletingId(id);
+            await api.deleteUpload(id);
+            await loadHistory();
+        } catch (err: any) {
+            alert(`Failed to delete: ${err.message}`);
+        } finally {
+            setDeletingId(null);
         }
     };
 
@@ -205,11 +225,12 @@ export default function UploadCenter() {
                                 <th className="px-6 py-3">Rows</th>
                                 <th className="px-6 py-3">Status</th>
                                 <th className="px-6 py-3">Date</th>
+                                <th className="px-6 py-3"></th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                             {uploads.length === 0 ? (
-                                <tr><td colSpan={5} className="px-6 py-8 text-center text-slate-400 text-sm">No uploads yet</td></tr>
+                                <tr><td colSpan={6} className="px-6 py-8 text-center text-slate-400 text-sm">No uploads yet</td></tr>
                             ) : uploads.map(u => (
                                 <tr key={u.id} className="hover:bg-slate-50 table-row-hover">
                                     <td className="px-6 py-3">
@@ -219,6 +240,16 @@ export default function UploadCenter() {
                                     <td className="px-6 py-3 text-slate-500">{u.rows_processed.toLocaleString()}</td>
                                     <td className="px-6 py-3"><StatusBadge status={u.status} /></td>
                                     <td className="px-6 py-3 text-slate-500">{new Date(u.uploaded_at).toLocaleString()}</td>
+                                    <td className="px-6 py-3 text-right">
+                                        <button
+                                            onClick={() => handleDelete(u.id, u.filename)}
+                                            disabled={deletingId === u.id}
+                                            title="Remove from history"
+                                            className="p-1.5 rounded text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
+                                            <Trash2 size={14} />
+                                        </button>
+                                    </td>
                                 </tr>
                             ))}
                         </tbody>
