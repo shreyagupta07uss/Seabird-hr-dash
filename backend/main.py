@@ -59,12 +59,9 @@ import os
 import re
 import hashlib
 import secrets
-import threading
-import uuid
-import traceback
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc, text
+from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
@@ -98,17 +95,8 @@ if DATABASE_URL.startswith("sqlite"):
         cursor.close()
 else:
     # Neon / PostgreSQL: aggressive pool settings to prevent SSL drops
-    #
-    # FIX v3.2.14: the ~45-55ms/row write speed we measured (2000 rows taking
-    # ~100s) is the classic signature of psycopg2's default executemany()
-    # sending one INSERT round-trip per row instead of batching many rows into
-    # fewer statements. executemany_mode/executemany_*_page_size below tell
-    # SQLAlchemy's psycopg2 dialect to use psycopg2.extras.execute_values
-    # under the hood, batching hundreds of rows into a single round trip. This
-    # is a SQLAlchemy 1.4-era knob; wrapped in try/except because SQLAlchemy
-    # 2.0 removed it (2.0 batches by default via "insertmanyvalues" instead,
-    # so the plain fallback below is already fast on 2.0).
-    _pg_engine_kwargs = dict(
+    engine = create_engine(
+        DATABASE_URL,
         pool_pre_ping=True,      # verify connection before use
         pool_recycle=300,        # recycle every 5 min (Neon drops idle >5min)
         pool_size=3,             # Neon free tier = 10 max concurrent
@@ -116,20 +104,6 @@ else:
         pool_timeout=30,         # wait up to 30s for a connection
         connect_args={"sslmode": "require"} if "sslmode" not in DATABASE_URL else {}
     )
-    try:
-        engine = create_engine(
-            DATABASE_URL,
-            executemany_mode="values_plus_batch",
-            executemany_values_page_size=1000,
-            executemany_batch_page_size=500,
-            **_pg_engine_kwargs
-        )
-        print("[DB] Postgres engine created with batched executemany (values_plus_batch)")
-    except TypeError:
-        # SQLAlchemy 2.x (or any version that doesn't recognize these kwargs) -
-        # falls back cleanly; 2.x batches multi-row inserts by default anyway.
-        engine = create_engine(DATABASE_URL, **_pg_engine_kwargs)
-        print("[DB] Postgres engine created without legacy executemany_mode kwargs (likely SQLAlchemy 2.x)")
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -240,19 +214,19 @@ class Attendance(Base):
     man_hrs = Column(Float, default=0)
     ot_hours = Column(Float, default=0)
     ot_headcount = Column(Float, default=0)
-    attendance_status = Column(String(30))
+    attendance_status = Column(String(30), index=True)   # INDEX: daily register filter
     late_minutes = Column(Integer, default=0)
     early_minutes = Column(Integer, default=0)
     single_punch = Column(String(5), default="No")
     is_match = Column(String(5), default="No")
     match_status = Column(String(30))
-    vendor = Column(String(50))
-    store = Column(String(50))
-    department = Column(String(50))
-    shift = Column(String(10))
+    vendor = Column(String(50), index=True)              # INDEX: vendor breakdown
+    store = Column(String(50), index=True)               # INDEX: store breakdown
+    department = Column(String(50), index=True)          # INDEX: dept breakdown
+    shift = Column(String(10), index=True)               # INDEX: shift breakdown
     category = Column(String(10))
     remark = Column(String(100))
-    issue = Column(String(50), default="-")
+    issue = Column(String(50), default="-", index=True)  # INDEX: issue filter
     source = Column(String(20), default="reconciliation")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -1464,37 +1438,99 @@ def get_daily_register(
     date_filter: Optional[str] = Query(None, alias="date"),
     vendor: Optional[str] = Query(None), store: Optional[str] = Query(None),
     department: Optional[str] = Query(None), status: Optional[str] = Query(None),
-    issue: Optional[str] = Query(None),  # FIX v3.2.5: Filter by issue type
+    issue: Optional[str] = Query(None),
     search: Optional[str] = Query(None), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db)
 ):
+    """Optimized daily register: avoids JOIN unless employee filters are used.
+    Uses selectinload to prevent N+1. Orders by Attendance.pr_number (indexed)
+    instead of Employee.pr_number to eliminate slow sorts."""
+    from sqlalchemy.orm import selectinload
+
     target_date = parse_date_br(date_filter) if date_filter else date.today()
     if not target_date:
         target_date = date.today()
-    q = db.query(Attendance).join(Employee).filter(Attendance.date == target_date)
-    if vendor: q = q.filter(Employee.vendor == vendor)
-    if store: q = q.filter(Employee.store == store)
-    if department: q = q.filter(Employee.department == department)
+
+    # If employee-side filters are active, resolve matching PRs first in a
+    # lightweight query, then filter Attendance by PR list. This avoids the
+    # heavy JOIN + COUNT + OFFSET pattern that kills performance.
+    pr_filter = None
+    needs_emp_lookup = bool(vendor or store or department or search)
+
+    if needs_emp_lookup:
+        emp_q = db.query(Employee.pr_number)
+        if vendor:   emp_q = emp_q.filter(Employee.vendor == vendor)
+        if store:    emp_q = emp_q.filter(Employee.store == store)
+        if department: emp_q = emp_q.filter(Employee.department == department)
+        if search:
+            emp_q = emp_q.filter(
+                (Employee.pr_number.ilike(f"%{search}%")) |
+                (Employee.name.ilike(f"%{search}%"))
+            )
+        pr_rows = emp_q.all()
+        pr_filter = {r[0] for r in pr_rows if r[0]}
+        if not pr_filter:
+            return {"data": [], "total": 0, "page": page, "total_pages": 1}
+
+    # Base Attendance query — NO JOIN, uses indexes on date + pr_number
+    q = db.query(Attendance).filter(Attendance.date == target_date)
     if status: q = q.filter(Attendance.attendance_status == status)
-    if issue: q = q.filter(Attendance.issue == issue)  # FIX v3.2.5: Filter by issue
-    if search: q = q.filter((Employee.pr_number.ilike(f"%{search}%")) | (Employee.name.ilike(f"%{search}%")))
+    if issue:  q = q.filter(Attendance.issue == issue)
+    if pr_filter: q = q.filter(Attendance.pr_number.in_(pr_filter))
+
+    # Fast count (index-only scan on date)
     total = q.count()
-    items = q.order_by(Employee.pr_number).offset((page - 1) * page_size).limit(page_size).all()
+
+    # Paginate and bulk-load employees in one extra query (selectinload)
+    items = (
+        q.options(selectinload(Attendance.employee))
+          .order_by(Attendance.pr_number)
+          .offset((page - 1) * page_size)
+          .limit(page_size)
+          .all()
+    )
+
     data = []
     for att in items:
+        emp = att.employee
         data.append({
-            "id": att.id, "pr_number": att.pr_number, "name": att.employee.name if att.employee else att.pr_number,
-            "vendor": att.vendor, "store": att.store, "department": att.department,
-            "assigned_shift": att.shift or (att.employee.shift if att.employee else "G"),  # Master assigned shift
-            "worked_shift": determine_worked_shift(att.essl_in, att.essl_out, att.tata_in, att.tata_out, att.shift or (att.employee.shift if att.employee else "G"), att.remark),
-            "category": att.employee.wc if att.employee else "BC",  # BC/WC/FLD category
-            "essl_in": att.essl_in, "essl_out": att.essl_out, "tata_in": att.tata_in, "tata_out": att.tata_out,
-            "final_in": att.final_in, "final_out": att.final_out, "worked_hours": att.worked_hours, "man_hrs": att.man_hrs,
-            "attendance_status": att.attendance_status, "ot_hours": att.ot_hours, "ot_headcount": att.ot_headcount,
-            "late_minutes": att.late_minutes, "early_minutes": att.early_minutes,
-            "single_punch": att.single_punch, "is_match": att.is_match, "issue": att.issue, "remark": att.remark
+            "id": att.id,
+            "pr_number": att.pr_number,
+            "name": emp.name if emp else att.pr_number,
+            "vendor": att.vendor or (emp.vendor if emp else ""),
+            "store": att.store or (emp.store if emp else ""),
+            "department": att.department or (emp.department if emp else ""),
+            "assigned_shift": att.shift or (emp.shift if emp else "G"),
+            "worked_shift": determine_worked_shift(
+                att.essl_in, att.essl_out, att.tata_in, att.tata_out,
+                att.shift or (emp.shift if emp else "G"), att.remark
+            ),
+            "category": emp.wc if emp else (att.category or "BC"),
+            "essl_in": att.essl_in,
+            "essl_out": att.essl_out,
+            "tata_in": att.tata_in,
+            "tata_out": att.tata_out,
+            "final_in": att.final_in,
+            "final_out": att.final_out,
+            "worked_hours": att.worked_hours,
+            "man_hrs": att.man_hrs,
+            "attendance_status": att.attendance_status,
+            "ot_hours": att.ot_hours,
+            "ot_headcount": att.ot_headcount,
+            "late_minutes": att.late_minutes,
+            "early_minutes": att.early_minutes,
+            "single_punch": att.single_punch,
+            "is_match": att.is_match,
+            "issue": att.issue,
+            "remark": att.remark
         })
-    return {"data": data, "total": total, "page": page, "total_pages": max(1, (total + page_size - 1) // page_size)}
+
+    return {
+        "data": data,
+        "total": total,
+        "page": page,
+        "total_pages": max(1, (total + page_size - 1) // page_size)
+    }
 
 @app.get("/api/v1/attendance/monthly/{pr_number}")
 def get_monthly_attendance(pr_number: str, month: Optional[str] = Query(None), db: Session = Depends(get_db)):
@@ -1643,31 +1679,9 @@ def get_upload_history(db: Session = Depends(get_db)):
     return [{"id": l.id, "type": l.file_type, "filename": l.filename, "rows_processed": l.rows_processed,
              "status": l.status, "uploaded_at": l.uploaded_at.isoformat()} for l in logs]
 
-@app.delete("/api/v1/upload/{upload_id}")
-def delete_upload(upload_id: int, db: Session = Depends(get_db)):
-    """Removes an entry from Upload History and clears its file_hash so the same file
-    can be re-uploaded without being blocked as a duplicate.
-
-    NOTE: this does NOT delete the attendance rows that upload created - the data
-    tables (TataAttendance, ESSLAttendance, etc.) don't currently track which upload
-    each row came from, so there's no reliable way to know which rows to remove without
-    re-processing the original file. If you need "undo this upload's data" as well,
-    that needs a schema change (an upload_log_id column on each attendance table) - say
-    the word and it can be added.
-    """
-    log = db.query(UploadLog).filter(UploadLog.id == upload_id).first()
-    if not log:
-        raise HTTPException(status_code=404, detail="Upload not found")
-    db.delete(log)
-    db.commit()
-    return {"status": "deleted", "id": upload_id}
-
 @app.post("/api/v1/upload/master")
-def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
-    # NOTE: sync `def` (not async) so Starlette runs this in a worker thread instead of
-    # blocking the single event loop for the whole upload - fixes ERR_HTTP2_PING_FAILED /
-    # "CORS" errors on large files, since the server can still answer keepalive pings.
-    contents = file.file.read()
+async def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+    contents = await file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -1684,11 +1698,6 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: S
     vendors_created = 0
     stores_created = 0
 
-    # Prefetch once instead of hitting the DB 3x per row (this was the main slowdown)
-    emp_by_pr = {e.pr_number: e for e in db.query(Employee).all() if e.pr_number}
-    existing_vendor_names = {v.name for v in db.query(Vendor.name).all()}
-    existing_store_names = {s.name for s in db.query(Store.name).all()}
-
     for row in rows:
         pr = str(row.get("PR", row.get("pr_number", row.get("PR Number", row.get("PR_Number", ""))))).strip()
         bio_val = row.get("Bio", row.get("BioID", None))
@@ -1702,16 +1711,15 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: S
         if not pr:
             continue
 
-        if vendor_name and vendor_name not in existing_vendor_names:
+        if vendor_name and not db.query(Vendor).filter(Vendor.name == vendor_name).first():
             db.add(Vendor(name=vendor_name))
-            existing_vendor_names.add(vendor_name)
             vendors_created += 1
-        if store_name and store_name not in existing_store_names:
+        if store_name and not db.query(Store).filter(Store.name == store_name).first():
             db.add(Store(name=store_name, location=store_name))
-            existing_store_names.add(store_name)
             stores_created += 1
+        db.flush()
 
-        emp = emp_by_pr.get(pr)
+        emp = db.query(Employee).filter(Employee.pr_number == pr).first()
         if emp:
             emp.bio_id = bio_id or emp.bio_id
             emp.name = name or emp.name
@@ -1722,7 +1730,7 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: S
             emp.status = normalize_employee_status(status_val) if status_val else emp.status
             emp.join_date = parse_date_br(row.get("DOJ", row.get("doj", ""))) or emp.join_date
         else:
-            new_emp = Employee(
+            db.add(Employee(
                 pr_number=pr, bio_id=bio_id, emp_code="", name=name or pr,
                 vendor=vendor_name, store=store_name, department="",
                 designation=str(row.get("Designation", row.get("designation", ""))).strip(),
@@ -1730,9 +1738,7 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: S
                 wc=category, bc="",
                 status=normalize_employee_status(status_val),
                 join_date=parse_date_br(row.get("DOJ", row.get("doj", "")))
-            )
-            db.add(new_emp)
-            emp_by_pr[pr] = new_emp  # so a duplicate PR later in the same file updates, not re-inserts
+            ))
         processed += 1
 
     db.commit()
@@ -1742,11 +1748,11 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: S
             "vendors_created": vendors_created, "stores_created": stores_created, "filename": file.filename}
 
 @app.post("/api/v1/upload/essl")
-def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+async def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
     import time as time_module
     start_time = time_module.time()
 
-    contents = file.file.read()
+    contents = await file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -2098,13 +2104,8 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     }
 
 @app.post("/api/v1/upload/tata")
-def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
-    # NOTE: sync `def` (not async) so this runs in a worker thread, not the event loop -
-    # fixes ERR_HTTP2_PING_FAILED / misleading "CORS" errors on large 30-sheet files.
-    import time as time_module
-    start_time = time_module.time()
-
-    contents = file.file.read()
+async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+    contents = await file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -2120,76 +2121,36 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
         db.commit()
         raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
 
-    # Prefetch every employee ONCE instead of up to 3 SELECTs per row (this was the
-    # main cause of the timeout - a 30-sheet file could mean 30,000+ rows x 3 queries).
-    all_employees = db.query(Employee).all()
-    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
-    emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
-    emp_by_name = {e.name.strip().upper(): e for e in all_employees if e.name}
-
-    def resolve_employee_fast(paycode: str, emp_name_val: str):
-        e = emp_by_pr.get(paycode)
-        if e:
-            return e
-        e = emp_by_code.get(paycode)
-        if e:
-            return e
-        if emp_name_val:
-            return emp_by_name.get(emp_name_val.strip().upper())
-        return None
-
-    # Pass 1: parse all rows in memory (no DB calls yet), track which dates are touched.
-    parsed = []
-    all_dates = set()
+    processed = 0
     for row in rows:
         paycode = str(row.get("PayCode", row.get("Pay Code", row.get("paycode", "")))).strip()
+        emp_name = str(row.get("Employee Name", row.get("EMP Name", row.get("EmployeeName", "")))).strip()
         att_date = parse_date_br(row.get("Date", row.get("date", "")))
+        in_time = safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", "")))))
+        out_time = safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", "")))))
+        man_hrs = float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0)
+        status_val = str(row.get("Status", row.get("status", "P"))).strip().upper()
+        dept_from_row = str(row.get("Department", row.get("department", ""))).strip()
+        division_from_row = str(row.get("Division", "")).strip()
+
         if not paycode or not att_date:
             continue
-        parsed.append({
-            "paycode": paycode,
-            "emp_name": str(row.get("Employee Name", row.get("EMP Name", row.get("EmployeeName", "")))).strip(),
-            "att_date": att_date,
-            "in_time": safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", ""))))),
-            "out_time": safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", ""))))),
-            "man_hrs": float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0),
-            "status_val": str(row.get("Status", row.get("status", "P"))).strip().upper(),
-            "dept_from_row": str(row.get("Department", row.get("department", ""))).strip(),
-            "division_from_row": str(row.get("Division", "")).strip(),
-            "row_shift_raw": row.get("Shift", row.get("Shift In Time", None)),
-            "category_raw": str(row.get("WC/BC", "")).strip(),
-            "contractor_raw": str(row.get("Contractor", "")).strip(),
-            "store_raw": str(row.get("Store", "")).strip(),
-            "early_going": str(row.get("Early Going", "")).strip(),
-            "shift_late": str(row.get("Shift Late", "")).strip(),
-        })
-        all_dates.add(att_date)
 
-    # Pass 2: bulk-fetch existing TataAttendance rows for just the date range touched
-    # (ONE query instead of one SELECT per row).
-    existing_map = {}
-    if parsed:
-        min_date, max_date = min(all_dates), max(all_dates)
-        for rec in db.query(TataAttendance).filter(TataAttendance.date >= min_date, TataAttendance.date <= max_date).all():
-            existing_map[(rec.pr_number, rec.date)] = rec
+        emp = db.query(Employee).filter(Employee.pr_number == paycode).first()
+        if not emp:
+            emp = db.query(Employee).filter(Employee.emp_code == paycode).first()
+        if not emp and emp_name:
+            emp = db.query(Employee).filter(func.upper(Employee.name) == emp_name.strip().upper()).first()
 
-    processed = 0
-    pending_inserts = {}  # key -> row dict, for new rows not yet in the DB or existing_map
-
-    for item in parsed:
-        paycode = item["paycode"]; att_date = item["att_date"]
-        in_time = item["in_time"]; out_time = item["out_time"]; man_hrs = item["man_hrs"]
-        status_val = item["status_val"]; dept_from_row = item["dept_from_row"]; division_from_row = item["division_from_row"]
-
-        emp = resolve_employee_fast(paycode, item["emp_name"])
         pr_number = emp.pr_number if emp else paycode
 
-        if item["row_shift_raw"]:
-            shift = safe_shift(str(item["row_shift_raw"]))
+        row_shift_raw = row.get("Shift", row.get("Shift In Time", None))
+        if row_shift_raw:
+            shift = safe_shift(str(row_shift_raw))
         else:
             shift = emp.shift if emp else "G"
 
-        category = normalize_category(item["category_raw"]).strip() or (emp.wc if emp else "BC")
+        category = normalize_category(str(row.get("WC/BC", ""))).strip() or (emp.wc if emp else "BC")
         if category == "":
             category = emp.wc if emp else "BC"
 
@@ -2204,9 +2165,8 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
         if status_val not in ["P", "A", "L", "HD", "WO", "SP"]:
             status_val = "P" if (in_time or out_time or man_hrs > 0) else "A"
 
+        existing_tata = db.query(TataAttendance).filter(TataAttendance.pr_number == pr_number, TataAttendance.date == att_date).first()
         ot_result = calculate_ot(shift, category, in_time, out_time, man_hrs)
-        key = (pr_number, att_date)
-        existing_tata = existing_map.get(key)
 
         if existing_tata:
             existing_tata.in_time = safe_time(in_time) or existing_tata.in_time
@@ -2216,43 +2176,31 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
             existing_tata.ot_hours = ot_result["calculated_ot_hours"]
             existing_tata.shift = safe_shift(shift)
             existing_tata.department = dept_from_row or division_from_row or existing_tata.department
-        elif key in pending_inserts:
-            # duplicate paycode+date appearing again later in the same file - update in place
-            pend = pending_inserts[key]
-            pend["in_time"] = safe_time(in_time) or pend["in_time"]
-            pend["out_time"] = safe_time(out_time) or pend["out_time"]
-            pend["man_hrs"] = man_hrs if man_hrs > 0 else pend["man_hrs"]
-            pend["status"] = status_val
-            pend["ot_hours"] = ot_result["calculated_ot_hours"]
-            pend["shift"] = safe_shift(shift)
-            pend["department"] = dept_from_row or division_from_row or pend["department"]
         else:
-            pending_inserts[key] = dict(
-                employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=item["emp_name"],
+            db.add(TataAttendance(
+                employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=emp_name,
                 date=att_date, in_time=safe_time(in_time), out_time=safe_time(out_time), man_hrs=man_hrs, status=status_val,
                 ot_hours=ot_result["calculated_ot_hours"],
-                early_going=item["early_going"], shift_late=item["shift_late"],
-                vendor=normalize_vendor(item["contractor_raw"] or (emp.vendor if emp else "")),
-                store=item["store_raw"] or (emp.store if emp else ""),
+                early_going=str(row.get("Early Going", "")).strip(), shift_late=str(row.get("Shift Late", "")).strip(),
+                vendor=normalize_vendor(str(row.get("Contractor", emp.vendor if emp else ""))),
+                store=str(row.get("Store", emp.store if emp else "")).strip(),
                 department=dept_from_row or division_from_row or (emp.department if emp else ""),
                 shift=safe_shift(shift)
-            )
+            ))
         processed += 1
-
-    if pending_inserts:
-        db.execute(TataAttendance.__table__.insert(), list(pending_inserts.values()))
+        if processed % 500 == 0:
+            db.commit()
 
     db.commit()
     db.add(UploadLog(file_type="tata", filename=file.filename, file_hash=file_hash, rows_processed=processed, status="Success"))
     db.commit()
-    elapsed = round(time_module.time() - start_time, 2)
     return {"status": "success", "type": "tata", "rows_processed": processed,
-            "sheets_read": sheets_read, "sheets_skipped": sheets_skipped, "elapsed_seconds": elapsed,
+            "sheets_read": sheets_read, "sheets_skipped": sheets_skipped,
             "filename": file.filename, "message": "Official attendance stored. Ready for reconciliation."}
 
 @app.post("/api/v1/upload/tata-all")
-def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
-    contents = file.file.read()
+async def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+    contents = await file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -2293,18 +2241,12 @@ def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db:
         monthly_data[key]["total_ot"] += ot
         processed += 1
 
-    # Prefetch existing monthly rows for just the year-months touched (one query instead
-    # of one SELECT per unique employee/month key).
-    year_months_touched = {ym for (_, ym) in monthly_data.keys()}
-    existing_monthly_map = {}
-    if year_months_touched:
-        for rec in db.query(MonthlyTataAttendance).filter(MonthlyTataAttendance.year_month.in_(year_months_touched)).all():
-            existing_monthly_map[(rec.pr_number, rec.year_month)] = rec
-
     for key, data in monthly_data.items():
         total_days = data["present"] + data["absent"] + data["leave"] + data["weekoff"] + data["half_day"]
         att_pct = (data["present"] / total_days * 100) if total_days > 0 else 0
-        existing_monthly = existing_monthly_map.get(key)
+        existing_monthly = db.query(MonthlyTataAttendance).filter(
+            MonthlyTataAttendance.pr_number == data["pr"], MonthlyTataAttendance.year_month == data["year_month"]
+        ).first()
         if existing_monthly:
             existing_monthly.present_days = data["present"]; existing_monthly.absent_days = data["absent"]
             existing_monthly.leave_days = data["leave"]; existing_monthly.weekoff_days = data["weekoff"]
@@ -2361,13 +2303,13 @@ def _parse_essl_side_sheet(ws) -> Dict[str, Dict[str, Any]]:
     return out
 
 @app.post("/api/v1/upload/daywise")
-def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
+async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
     """Single-day combined upload: one workbook with 'Essl In', 'Essl Out', and 'Tata'
     sheets (exactly the format HR pulls each day). ESSL sheets carry one time column per
     day (header like '22 W'), which doesn't carry an unambiguous date on its own, so the
     date is taken from the Tata sheet's own Date column unless target_date is passed
     explicitly (accepts 'DD/MM/YYYY' or 'YYYY-MM-DD')."""
-    contents = file.file.read()
+    contents = await file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -2457,9 +2399,6 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
         db.commit()
 
     # ---- Tata (same upsert logic as /api/v1/upload/tata, scoped to this file) ----
-    existing_tata_map = {
-        rec.pr_number: rec for rec in db.query(TataAttendance).filter(TataAttendance.date == resolved_date).all()
-    }
     tata_processed = 0
     for row in tata_rows:
         paycode = str(row.get("PayCode", row.get("Pay Code", ""))).strip()
@@ -2495,7 +2434,7 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
         if status_val not in ["P", "A", "L", "HD", "WO", "SP"]:
             status_val = "P" if (in_time or out_time or man_hrs > 0) else "A"
 
-        existing_tata = existing_tata_map.get(pr_number)
+        existing_tata = db.query(TataAttendance).filter(TataAttendance.pr_number == pr_number, TataAttendance.date == att_date).first()
         ot_result = calculate_ot(shift, category, in_time, out_time, man_hrs)
 
         if existing_tata:
@@ -2507,7 +2446,7 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
             existing_tata.shift = safe_shift(shift)
             existing_tata.department = dept_from_row or division_from_row or existing_tata.department
         else:
-            new_tata = TataAttendance(
+            db.add(TataAttendance(
                 employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=emp_name,
                 date=att_date, in_time=safe_time(in_time), out_time=safe_time(out_time), man_hrs=man_hrs, status=status_val,
                 ot_hours=ot_result["calculated_ot_hours"],
@@ -2516,10 +2455,10 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
                 store=str(row.get("Store", emp.store if emp else "")).strip(),
                 department=dept_from_row or division_from_row or (emp.department if emp else ""),
                 shift=safe_shift(shift)
-            )
-            db.add(new_tata)
-            existing_tata_map[pr_number] = new_tata  # guard against a dup paycode later in the same file
+            ))
         tata_processed += 1
+        if tata_processed % 500 == 0:
+            db.commit()
 
     try:
         db.commit()
@@ -2980,152 +2919,12 @@ def run_reconciliation(target_date: str = Form(...), db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail="Invalid date format")
     return _reconcile_single_date(d, db)
 
-# ============================================================================
-# RECONCILIATION AS A BACKGROUND JOB
-# ----------------------------------------------------------------------------
-# Railway's public-network edge proxy enforces a hard 5-minute timeout on every
-# HTTP request, and it is not configurable. A full month's reconciliation
-# (~1,100 employees x 30 days) can take longer than that even after the
-# bulk_update_mappings fix, so the proxy silently drops the connection before
-# our app can respond - the browser then reports this (misleadingly) as a CORS
-# error, because no response with headers ever arrives at all.
-#
-# Fix: the POST endpoint below no longer does the work inline. It kicks the
-# work off in a background thread (with its OWN db session, since the
-# request-scoped one closes as soon as the endpoint returns) and immediately
-# responds with a job_id. The frontend polls the GET status endpoint every
-# few seconds until the job reports "completed" or "failed". No single HTTP
-# request is ever open longer than a couple seconds, so the 300s proxy cap
-# never comes into play, regardless of how big the month is.
-# ============================================================================
-
-_reconciliation_jobs: Dict[str, Dict[str, Any]] = {}
-_reconciliation_jobs_lock = threading.Lock()
-
-# FIX v3.2.13: Guard against overlapping runs. Background jobs are daemon threads -
-# nothing kills them if the browser tab closes, a request times out client-side, or
-# someone clicks "Run Whole Month" again before the first run finished. Two runs for
-# the same rows will fight over Postgres row locks: whichever one is first grabs a
-# lock on an (pr_number, date) row and holds it open in an uncommitted transaction;
-# the second one's INSERT/UPDATE on that same row then waits *forever* for a lock
-# that will never be released, because the first job is stuck too. This is almost
-# certainly why "writing to DB" hung indefinitely even on a tiny first chunk of 2000
-# rows - it was queued up behind an earlier stuck attempt's open transaction.
-_active_reconciliation_month: Optional[str] = None  # month string, or None if idle
-_active_reconciliation_job_id: Optional[str] = None
-
-
-def _set_job(job_id: str, **fields):
-    with _reconciliation_jobs_lock:
-        _reconciliation_jobs[job_id].update(fields)
-
-
-@app.post("/api/v1/reconciliation/run-month")
-def start_reconciliation_month(month: str = Form(...)):
-    """Kick off a month reconciliation in the background and return immediately."""
-    global _active_reconciliation_month, _active_reconciliation_job_id
-
-    # Fail fast on a bad month string before we ever open a thread/db session.
-    parse_year_month(month)
-
-    with _reconciliation_jobs_lock:
-        if _active_reconciliation_month is not None:
-            # Don't start a second run that will just deadlock against the first.
-            # Hand back the job that's already in flight instead.
-            existing_id = _active_reconciliation_job_id
-            existing = _reconciliation_jobs.get(existing_id) if existing_id else None
-            return {
-                "status": "already_running",
-                "job_id": existing_id,
-                "month": _active_reconciliation_month,
-                "detail": (
-                    f"A reconciliation for {_active_reconciliation_month} is already running "
-                    f"(job {existing_id}). Poll that job instead of starting a new one - "
-                    f"running two at once for overlapping rows will deadlock both."
-                ),
-                "current_stage": existing.get("stage") if existing else None,
-            }
-        _active_reconciliation_month = month
-
-    job_id = str(uuid.uuid4())
-    _active_reconciliation_job_id = job_id
-    with _reconciliation_jobs_lock:
-        _reconciliation_jobs[job_id] = {
-            "job_id": job_id,
-            "month": month,
-            "status": "running",
-            "stage": "queued",
-            "stage_at": datetime.utcnow().isoformat(),
-            "result": None,
-            "error": None,
-            "started_at": datetime.utcnow().isoformat(),
-            "finished_at": None,
-        }
-
-    def _worker():
-        global _active_reconciliation_month, _active_reconciliation_job_id
-        worker_db = SessionLocal()
-        started = datetime.utcnow()
-
-        # FIX v3.2.13: if this job DOES end up blocked on a lock (e.g. from an old
-        # orphaned transaction that predates this fix), fail loudly after a bounded
-        # wait instead of hanging forever with no signal. Postgres-only - SQLite
-        # doesn't support these.
-        if not DATABASE_URL.startswith("sqlite"):
-            try:
-                worker_db.execute(text("SET statement_timeout = '120s'"))
-                worker_db.execute(text("SET lock_timeout = '30s'"))
-            except Exception:
-                pass  # best-effort; don't block the run over this
-
-        def on_stage(stage: str):
-            elapsed = (datetime.utcnow() - started).total_seconds()
-            print(f"[RECONCILIATION JOB {job_id}] {stage} (+{elapsed:.1f}s)")
-            _set_job(job_id, stage=stage, stage_at=datetime.utcnow().isoformat())
-
-        try:
-            result = _run_reconciliation_month_logic(month, worker_db, on_stage=on_stage)
-            _set_job(job_id, status="completed", result=result,
-                      finished_at=datetime.utcnow().isoformat())
-        except Exception as e:
-            worker_db.rollback()
-            print(f"[RECONCILIATION JOB {job_id}] FAILED: {e}")
-            traceback.print_exc()
-            _set_job(job_id, status="failed", error=str(e),
-                      finished_at=datetime.utcnow().isoformat())
-        finally:
-            worker_db.close()
-            with _reconciliation_jobs_lock:
-                _active_reconciliation_month = None
-                _active_reconciliation_job_id = None
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-    return {"status": "started", "job_id": job_id, "month": month}
-
-
-
-@app.get("/api/v1/reconciliation/run-month/{job_id}")
-def get_reconciliation_month_status(job_id: str):
-    """Poll this to find out whether a background reconciliation job is done."""
-    with _reconciliation_jobs_lock:
-        job = _reconciliation_jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found (it may have expired after a server restart)")
-    return job
-
-
 # FIX v3.2: Completely rewritten with bulk pre-fetch to eliminate timeout
-def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> Dict[str, Any]:
-    def stage(name: str):
-        if on_stage:
-            on_stage(name)
-
+@app.post("/api/v1/reconciliation/run-month")
+def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_db)):
     year, mon = parse_year_month(month)
     start = date(year, mon, 1)
     end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
-
-    stage("fetching employees")
 
     employees = db.query(Employee).all()
     emp_ids = [e.id for e in employees]
@@ -3134,7 +2933,6 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
     pr_numbers = [e.pr_number for e in employees]
 
     # FIX v3.2: Pre-fetch ALL data for the ENTIRE month in 5 bulk queries
-    stage(f"prefetching ESSL data ({len(pr_numbers)} employees)")
     all_essl = db.query(ESSLAttendance).filter(
         ESSLAttendance.pr_number.in_(pr_numbers),
         ESSLAttendance.date >= start,
@@ -3145,7 +2943,6 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
         key = (e.pr_number, e.date.isoformat())
         essl_map[key] = e
 
-    stage("prefetching Tata data")
     all_tata = db.query(TataAttendance).filter(
         TataAttendance.pr_number.in_(pr_numbers),
         TataAttendance.date >= start,
@@ -3161,7 +2958,6 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
     tata_prs_month = set(t.pr_number for t in all_tata if t.pr_number)
     tata_only_prs = tata_prs_month - essl_prs_month
 
-    stage("prefetching existing Attendance rows")
     all_att = db.query(Attendance).filter(
         Attendance.pr_number.in_(pr_numbers),
         Attendance.date >= start,
@@ -3172,7 +2968,6 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
         key = (a.pr_number, a.date.isoformat())
         att_map[key] = a
 
-    stage("prefetching reconciliation rows")
     all_recon = db.query(AttendanceReconciliation).filter(
         AttendanceReconciliation.pr_number.in_(pr_numbers),
         AttendanceReconciliation.date >= start,
@@ -3183,7 +2978,6 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
         key = (r.pr_number, r.date.isoformat())
         recon_map[key] = r
 
-    stage("prefetching HR actions")
     all_actions = db.query(HRAction).filter(
         HRAction.pr_number.in_(pr_numbers),
         HRAction.date >= start,
@@ -3194,7 +2988,6 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
         key = (a.pr_number, a.date.isoformat(), a.action_type)
         action_map[key] = a
 
-    stage("prefetching overtime rows")
     all_ot = db.query(Overtime).filter(
         Overtime.pr_number.in_(pr_numbers),
         Overtime.date >= start,
@@ -3205,10 +2998,8 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
         key = (o.pr_number, o.date.isoformat())
         ot_map[key] = o
 
-    stage(f"processing {len(pr_numbers)} employees x days in memory")
     # Process entirely in memory
     attendance_to_insert = []
-    attendance_updates = []  # dicts for bulk_update_mappings - see note below
     recon_to_insert = []
     actions_to_insert = []
     ot_to_insert = []
@@ -3246,20 +3037,26 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
                 att_key = (emp.pr_number, d_iso)
                 if att_key in att_map:
                     existing = att_map[att_key]
-                    # NOTE: appending a plain dict for bulk_update_mappings() instead of
-                    # mutating the ORM object directly. With ~30k rows/month, mutating
-                    # tracked ORM objects makes SQLAlchemy issue one UPDATE per row at
-                    # commit time (this was the actual cause of the 300s timeout) -
-                    # bulk_update_mappings does it as a single fast batched statement.
-                    attendance_updates.append({
-                        "id": existing.id,
-                        "essl_in": None, "essl_out": None, "tata_in": None, "tata_out": None,
-                        "final_in": None, "final_out": None, "worked_hours": 0, "man_hrs": 0,
-                        "ot_hours": 0, "ot_headcount": 0, "attendance_status": display_status,
-                        "late_minutes": 0, "early_minutes": 0, "single_punch": "No",
-                        "is_match": "No", "match_status": match_status,
-                        "shift": shift, "category": category, "issue": issue, "remark": remark,
-                    })
+                    existing.essl_in = None
+                    existing.essl_out = None
+                    existing.tata_in = None
+                    existing.tata_out = None
+                    existing.final_in = None
+                    existing.final_out = None
+                    existing.worked_hours = 0
+                    existing.man_hrs = 0
+                    existing.ot_hours = 0
+                    existing.ot_headcount = 0
+                    existing.attendance_status = display_status
+                    existing.late_minutes = 0
+                    existing.early_minutes = 0
+                    existing.single_punch = "No"
+                    existing.is_match = "No"
+                    existing.match_status = match_status
+                    existing.shift = shift
+                    existing.category = category
+                    existing.issue = issue
+                    existing.remark = remark
                 else:
                     attendance_to_insert.append(Attendance(
                         employee_id=emp.id, pr_number=emp.pr_number, emp_code=emp.emp_code, date=d,
@@ -3453,27 +3250,33 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
             att_key = (emp.pr_number, d_iso)
             if att_key in att_map:
                 existing = att_map[att_key]
-                # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
+                                # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
                 essl_has_real_punches = bool(essl_in) or bool(essl_out)
                 tata_has_real_punches = bool(tata_in) or bool(tata_out)
                 if not essl_has_real_punches and tata_has_real_punches:
-                    essl_in_upd, essl_out_upd = tata_in, tata_out
+                    existing.essl_in = tata_in
+                    existing.essl_out = tata_out
                 else:
-                    essl_in_upd, essl_out_upd = essl_in, essl_out
-                attendance_updates.append({
-                    "id": existing.id,
-                    "essl_in": essl_in_upd, "essl_out": essl_out_upd,
-                    "tata_in": tata_in, "tata_out": tata_out,
-                    "final_in": final_in, "final_out": final_out,
-                    "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
-                    "ot_hours": ot_hours, "ot_headcount": ot_headcount,
-                    "attendance_status": display_status,
-                    "late_minutes": late_minutes, "early_minutes": early_minutes,
-                    "single_punch": single_punch,
-                    "is_match": "Yes" if match_status == "Matched" else "No",
-                    "match_status": match_status, "issue": issue,
-                    "shift": shift, "category": category, "remark": remark,
-                })
+                    existing.essl_in = essl_in
+                    existing.essl_out = essl_out
+                existing.tata_in = tata_in
+                existing.tata_out = tata_out
+                existing.final_in = final_in
+                existing.final_out = final_out
+                existing.worked_hours = worked_hours
+                existing.man_hrs = tata_man_hrs
+                existing.ot_hours = ot_hours
+                existing.ot_headcount = ot_headcount
+                existing.attendance_status = display_status
+                existing.late_minutes = late_minutes
+                existing.early_minutes = early_minutes
+                existing.single_punch = single_punch
+                existing.is_match = "Yes" if match_status == "Matched" else "No"
+                existing.match_status = match_status
+                existing.issue = issue
+                existing.shift = shift
+                existing.category = category
+                existing.remark = remark
             else:
             # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
                 essl_has_real_punches = bool(essl_in) or bool(essl_out)
@@ -3532,135 +3335,33 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
                     totals["hr_actions_created"] += 1
 
         days_processed += 1
-        stage(f"processed {days_processed} day(s) in memory "
-              f"({len(attendance_to_insert)} new, {len(attendance_updates)} updates so far)")
         d += timedelta(days=1)
 
     # FIX v3.2: Bulk insert everything at once
-    # FIX v3.2.11: this was the actual cause of the 300s timeout. On a re-run (most
-    # days already have an Attendance row from a prior reconciliation), the old code
-    # mutated ~30,000 already-persistent ORM objects directly, which makes SQLAlchemy
-    # issue one individual UPDATE per row at commit() - very slow, especially on
-    # Railway's disk. bulk_update_mappings() below does it as a handful of fast
-    # batched statements instead.
-    #
-    # FIX v3.2.12: this whole block used to be ONE stage with no visibility into
-    # progress - on a big month (tens of thousands of rows) it could sit there for
-    # minutes with no way to tell "slow" from "stuck". Now it writes in chunks and
-    # reports progress after each one, and flushes (not commits) between chunks so
-    # the whole write is still one atomic transaction - a crash partway through
-    # still rolls back cleanly, it's just now visible while it's happening.
-    CHUNK = 2000
+    if attendance_to_insert:
+        db.bulk_save_objects(attendance_to_insert)
+    if recon_to_insert:
+        db.bulk_save_objects(recon_to_insert)
+    if actions_to_insert:
+        db.bulk_save_objects(actions_to_insert)
+    if ot_to_insert:
+        db.bulk_save_objects(ot_to_insert)
 
-    def _write_chunked(objects, label):
-        total = len(objects)
-        if not total:
-            return
-        for i in range(0, total, CHUNK):
-            chunk = objects[i:i + CHUNK]
-            db.bulk_save_objects(chunk)
-            db.flush()
-            done = min(i + CHUNK, total)
-            stage(f"writing {label}: {done}/{total}")
-
-    def _update_chunked(mappings, label):
-        total = len(mappings)
-        if not total:
-            return
-        for i in range(0, total, CHUNK):
-            chunk = mappings[i:i + CHUNK]
-            db.bulk_update_mappings(Attendance, chunk)
-            db.flush()
-            done = min(i + CHUNK, total)
-            stage(f"updating {label}: {done}/{total}")
-
-    stage(f"starting DB write: {len(attendance_to_insert)} inserts, "
-          f"{len(attendance_updates)} updates, {len(recon_to_insert)} recon, "
-          f"{len(actions_to_insert)} actions, {len(ot_to_insert)} OT rows")
-    _write_chunked(attendance_to_insert, "Attendance inserts")
-    _update_chunked(attendance_updates, "Attendance updates")
-    _write_chunked(recon_to_insert, "reconciliation rows")
-    _write_chunked(actions_to_insert, "HR actions")
-    _write_chunked(ot_to_insert, "overtime rows")
-
-    stage("committing DB writes")
     db.commit()
 
-    stage("checking OT thresholds")
-    # Post-process: Check OT thresholds for employees who accrued OT this month.
-    # FIX: this used to call check_ot_thresholds() - 2 SUM queries + up to 2 existence
-    # queries - once per employee PER DAY that had OT. For a full month with many
-    # employees on OT, that was easily thousands of extra round-trips and was the
-    # main reason reconciliation felt slow. Now it's computed once from data already
-    # in memory, plus 2 bulk existence queries total.
-    month_ot_by_pr: Dict[str, List[tuple]] = {}
-    for o in all_ot:  # existing Overtime rows for the month (already fetched above)
-        if o.ot_hours and o.ot_hours > 0:
-            month_ot_by_pr.setdefault(o.pr_number, []).append((o.date, o.ot_hours))
-    for o in ot_to_insert:  # newly created this run
-        if o.ot_hours and o.ot_hours > 0:
-            month_ot_by_pr.setdefault(o.pr_number, []).append((o.date, o.ot_hours))
+    # Post-process: Check OT thresholds for any employee who accrued OT this month
+    ot_employees = db.query(Overtime.pr_number, Overtime.date).filter(
+        Overtime.date >= start,
+        Overtime.date < end,
+        Overtime.ot_hours > 0
+    ).distinct().all()
+    for pr, dt in ot_employees:
+        emp = emp_by_pr.get(pr)
+        if emp:
+            check_ot_thresholds(pr, emp.name, dt, db)
+    if ot_employees:
+        db.commit()
 
-    if month_ot_by_pr:
-        prs_with_ot = list(month_ot_by_pr.keys())
-        existing_weekly = db.query(HRAction.pr_number, HRAction.date).filter(
-            HRAction.pr_number.in_(prs_with_ot),
-            HRAction.action_type == "OT Weekly Threshold",
-            HRAction.date >= start - timedelta(days=6), HRAction.date < end
-        ).all()
-        weekly_flagged_dates: Dict[str, List[date]] = {}
-        for pr, dt in existing_weekly:
-            weekly_flagged_dates.setdefault(pr, []).append(dt)
-
-        existing_monthly_prs = {
-            pr for (pr,) in db.query(HRAction.pr_number).filter(
-                HRAction.pr_number.in_(prs_with_ot),
-                HRAction.action_type == "OT Monthly Threshold",
-                HRAction.date >= start, HRAction.date < end
-            ).distinct().all()
-        }
-
-        threshold_actions_to_insert = []
-        for pr, entries in month_ot_by_pr.items():
-            emp = emp_by_pr.get(pr)
-            if not emp:
-                continue
-            entries.sort(key=lambda x: x[0])
-            already_flagged = weekly_flagged_dates.get(pr, [])
-            weekly_alert_added = False
-
-            for d_i, _ in entries:
-                week_start_i = d_i - timedelta(days=6)
-                weekly_sum = round(sum(h for dd, h in entries if week_start_i <= dd <= d_i), 2)
-                if weekly_sum > OT_WEEKLY_THRESHOLD and not weekly_alert_added:
-                    if not any(week_start_i <= fd <= d_i for fd in already_flagged):
-                        threshold_actions_to_insert.append(HRAction(
-                            pr_number=pr, emp_name=emp.name, date=d_i,
-                            action_type="OT Weekly Threshold",
-                            description=(f"{emp.name} ({pr}) has exceeded the weekly OT limit: "
-                                         f"{weekly_sum}h / {OT_WEEKLY_THRESHOLD}h (week ending {d_i.isoformat()})"),
-                            priority="High", assigned_to="HR Manager"
-                        ))
-                        weekly_alert_added = True
-                        totals["hr_actions_created"] += 1
-
-            monthly_sum = round(sum(h for _, h in entries), 2)
-            if monthly_sum > OT_MONTHLY_THRESHOLD and pr not in existing_monthly_prs:
-                last_date = entries[-1][0]
-                threshold_actions_to_insert.append(HRAction(
-                    pr_number=pr, emp_name=emp.name, date=last_date,
-                    action_type="OT Monthly Threshold",
-                    description=(f"{emp.name} ({pr}) has exceeded the monthly OT limit: "
-                                 f"{monthly_sum}h / {OT_MONTHLY_THRESHOLD}h"),
-                    priority="High", assigned_to="HR Manager"
-                ))
-                totals["hr_actions_created"] += 1
-
-        if threshold_actions_to_insert:
-            db.bulk_save_objects(threshold_actions_to_insert)
-            db.commit()
-
-    stage("done")
     return {
         "status": "completed",
         "month": month,
