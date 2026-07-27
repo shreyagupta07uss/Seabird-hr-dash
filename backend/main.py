@@ -64,7 +64,7 @@ import uuid
 import traceback
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc
+from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc, text
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
@@ -98,8 +98,17 @@ if DATABASE_URL.startswith("sqlite"):
         cursor.close()
 else:
     # Neon / PostgreSQL: aggressive pool settings to prevent SSL drops
-    engine = create_engine(
-        DATABASE_URL,
+    #
+    # FIX v3.2.14: the ~45-55ms/row write speed we measured (2000 rows taking
+    # ~100s) is the classic signature of psycopg2's default executemany()
+    # sending one INSERT round-trip per row instead of batching many rows into
+    # fewer statements. executemany_mode/executemany_*_page_size below tell
+    # SQLAlchemy's psycopg2 dialect to use psycopg2.extras.execute_values
+    # under the hood, batching hundreds of rows into a single round trip. This
+    # is a SQLAlchemy 1.4-era knob; wrapped in try/except because SQLAlchemy
+    # 2.0 removed it (2.0 batches by default via "insertmanyvalues" instead,
+    # so the plain fallback below is already fast on 2.0).
+    _pg_engine_kwargs = dict(
         pool_pre_ping=True,      # verify connection before use
         pool_recycle=300,        # recycle every 5 min (Neon drops idle >5min)
         pool_size=3,             # Neon free tier = 10 max concurrent
@@ -107,6 +116,20 @@ else:
         pool_timeout=30,         # wait up to 30s for a connection
         connect_args={"sslmode": "require"} if "sslmode" not in DATABASE_URL else {}
     )
+    try:
+        engine = create_engine(
+            DATABASE_URL,
+            executemany_mode="values_plus_batch",
+            executemany_values_page_size=1000,
+            executemany_batch_page_size=500,
+            **_pg_engine_kwargs
+        )
+        print("[DB] Postgres engine created with batched executemany (values_plus_batch)")
+    except TypeError:
+        # SQLAlchemy 2.x (or any version that doesn't recognize these kwargs) -
+        # falls back cleanly; 2.x batches multi-row inserts by default anyway.
+        engine = create_engine(DATABASE_URL, **_pg_engine_kwargs)
+        print("[DB] Postgres engine created without legacy executemany_mode kwargs (likely SQLAlchemy 2.x)")
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -2979,6 +3002,18 @@ def run_reconciliation(target_date: str = Form(...), db: Session = Depends(get_d
 _reconciliation_jobs: Dict[str, Dict[str, Any]] = {}
 _reconciliation_jobs_lock = threading.Lock()
 
+# FIX v3.2.13: Guard against overlapping runs. Background jobs are daemon threads -
+# nothing kills them if the browser tab closes, a request times out client-side, or
+# someone clicks "Run Whole Month" again before the first run finished. Two runs for
+# the same rows will fight over Postgres row locks: whichever one is first grabs a
+# lock on an (pr_number, date) row and holds it open in an uncommitted transaction;
+# the second one's INSERT/UPDATE on that same row then waits *forever* for a lock
+# that will never be released, because the first job is stuck too. This is almost
+# certainly why "writing to DB" hung indefinitely even on a tiny first chunk of 2000
+# rows - it was queued up behind an earlier stuck attempt's open transaction.
+_active_reconciliation_month: Optional[str] = None  # month string, or None if idle
+_active_reconciliation_job_id: Optional[str] = None
+
 
 def _set_job(job_id: str, **fields):
     with _reconciliation_jobs_lock:
@@ -2988,10 +3023,32 @@ def _set_job(job_id: str, **fields):
 @app.post("/api/v1/reconciliation/run-month")
 def start_reconciliation_month(month: str = Form(...)):
     """Kick off a month reconciliation in the background and return immediately."""
+    global _active_reconciliation_month, _active_reconciliation_job_id
+
     # Fail fast on a bad month string before we ever open a thread/db session.
     parse_year_month(month)
 
+    with _reconciliation_jobs_lock:
+        if _active_reconciliation_month is not None:
+            # Don't start a second run that will just deadlock against the first.
+            # Hand back the job that's already in flight instead.
+            existing_id = _active_reconciliation_job_id
+            existing = _reconciliation_jobs.get(existing_id) if existing_id else None
+            return {
+                "status": "already_running",
+                "job_id": existing_id,
+                "month": _active_reconciliation_month,
+                "detail": (
+                    f"A reconciliation for {_active_reconciliation_month} is already running "
+                    f"(job {existing_id}). Poll that job instead of starting a new one - "
+                    f"running two at once for overlapping rows will deadlock both."
+                ),
+                "current_stage": existing.get("stage") if existing else None,
+            }
+        _active_reconciliation_month = month
+
     job_id = str(uuid.uuid4())
+    _active_reconciliation_job_id = job_id
     with _reconciliation_jobs_lock:
         _reconciliation_jobs[job_id] = {
             "job_id": job_id,
@@ -3006,8 +3063,20 @@ def start_reconciliation_month(month: str = Form(...)):
         }
 
     def _worker():
+        global _active_reconciliation_month, _active_reconciliation_job_id
         worker_db = SessionLocal()
         started = datetime.utcnow()
+
+        # FIX v3.2.13: if this job DOES end up blocked on a lock (e.g. from an old
+        # orphaned transaction that predates this fix), fail loudly after a bounded
+        # wait instead of hanging forever with no signal. Postgres-only - SQLite
+        # doesn't support these.
+        if not DATABASE_URL.startswith("sqlite"):
+            try:
+                worker_db.execute(text("SET statement_timeout = '120s'"))
+                worker_db.execute(text("SET lock_timeout = '30s'"))
+            except Exception:
+                pass  # best-effort; don't block the run over this
 
         def on_stage(stage: str):
             elapsed = (datetime.utcnow() - started).total_seconds()
@@ -3026,10 +3095,14 @@ def start_reconciliation_month(month: str = Form(...)):
                       finished_at=datetime.utcnow().isoformat())
         finally:
             worker_db.close()
+            with _reconciliation_jobs_lock:
+                _active_reconciliation_month = None
+                _active_reconciliation_job_id = None
 
     threading.Thread(target=_worker, daemon=True).start()
 
     return {"status": "started", "job_id": job_id, "month": month}
+
 
 
 @app.get("/api/v1/reconciliation/run-month/{job_id}")
