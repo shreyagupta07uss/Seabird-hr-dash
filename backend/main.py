@@ -59,6 +59,9 @@ import os
 import re
 import hashlib
 import secrets
+import threading
+import uuid
+import traceback
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc
@@ -2954,9 +2957,84 @@ def run_reconciliation(target_date: str = Form(...), db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail="Invalid date format")
     return _reconcile_single_date(d, db)
 
-# FIX v3.2: Completely rewritten with bulk pre-fetch to eliminate timeout
+# ============================================================================
+# RECONCILIATION AS A BACKGROUND JOB
+# ----------------------------------------------------------------------------
+# Railway's public-network edge proxy enforces a hard 5-minute timeout on every
+# HTTP request, and it is not configurable. A full month's reconciliation
+# (~1,100 employees x 30 days) can take longer than that even after the
+# bulk_update_mappings fix, so the proxy silently drops the connection before
+# our app can respond - the browser then reports this (misleadingly) as a CORS
+# error, because no response with headers ever arrives at all.
+#
+# Fix: the POST endpoint below no longer does the work inline. It kicks the
+# work off in a background thread (with its OWN db session, since the
+# request-scoped one closes as soon as the endpoint returns) and immediately
+# responds with a job_id. The frontend polls the GET status endpoint every
+# few seconds until the job reports "completed" or "failed". No single HTTP
+# request is ever open longer than a couple seconds, so the 300s proxy cap
+# never comes into play, regardless of how big the month is.
+# ============================================================================
+
+_reconciliation_jobs: Dict[str, Dict[str, Any]] = {}
+_reconciliation_jobs_lock = threading.Lock()
+
+
+def _set_job(job_id: str, **fields):
+    with _reconciliation_jobs_lock:
+        _reconciliation_jobs[job_id].update(fields)
+
+
 @app.post("/api/v1/reconciliation/run-month")
-def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_db)):
+def start_reconciliation_month(month: str = Form(...)):
+    """Kick off a month reconciliation in the background and return immediately."""
+    # Fail fast on a bad month string before we ever open a thread/db session.
+    parse_year_month(month)
+
+    job_id = str(uuid.uuid4())
+    with _reconciliation_jobs_lock:
+        _reconciliation_jobs[job_id] = {
+            "job_id": job_id,
+            "month": month,
+            "status": "running",
+            "result": None,
+            "error": None,
+            "started_at": datetime.utcnow().isoformat(),
+            "finished_at": None,
+        }
+
+    def _worker():
+        worker_db = SessionLocal()
+        try:
+            result = _run_reconciliation_month_logic(month, worker_db)
+            _set_job(job_id, status="completed", result=result,
+                      finished_at=datetime.utcnow().isoformat())
+        except Exception as e:
+            worker_db.rollback()
+            print(f"[RECONCILIATION JOB {job_id}] FAILED: {e}")
+            traceback.print_exc()
+            _set_job(job_id, status="failed", error=str(e),
+                      finished_at=datetime.utcnow().isoformat())
+        finally:
+            worker_db.close()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    return {"status": "started", "job_id": job_id, "month": month}
+
+
+@app.get("/api/v1/reconciliation/run-month/{job_id}")
+def get_reconciliation_month_status(job_id: str):
+    """Poll this to find out whether a background reconciliation job is done."""
+    with _reconciliation_jobs_lock:
+        job = _reconciliation_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found (it may have expired after a server restart)")
+    return job
+
+
+# FIX v3.2: Completely rewritten with bulk pre-fetch to eliminate timeout
+def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
     year, mon = parse_year_month(month)
     start = date(year, mon, 1)
     end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
