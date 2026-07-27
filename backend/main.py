@@ -3470,19 +3470,45 @@ def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> D
     # issue one individual UPDATE per row at commit() - very slow, especially on
     # Railway's disk. bulk_update_mappings() below does it as a handful of fast
     # batched statements instead.
-    stage(f"writing to DB: {len(attendance_to_insert)} inserts, "
+    #
+    # FIX v3.2.12: this whole block used to be ONE stage with no visibility into
+    # progress - on a big month (tens of thousands of rows) it could sit there for
+    # minutes with no way to tell "slow" from "stuck". Now it writes in chunks and
+    # reports progress after each one, and flushes (not commits) between chunks so
+    # the whole write is still one atomic transaction - a crash partway through
+    # still rolls back cleanly, it's just now visible while it's happening.
+    CHUNK = 2000
+
+    def _write_chunked(objects, label):
+        total = len(objects)
+        if not total:
+            return
+        for i in range(0, total, CHUNK):
+            chunk = objects[i:i + CHUNK]
+            db.bulk_save_objects(chunk)
+            db.flush()
+            done = min(i + CHUNK, total)
+            stage(f"writing {label}: {done}/{total}")
+
+    def _update_chunked(mappings, label):
+        total = len(mappings)
+        if not total:
+            return
+        for i in range(0, total, CHUNK):
+            chunk = mappings[i:i + CHUNK]
+            db.bulk_update_mappings(Attendance, chunk)
+            db.flush()
+            done = min(i + CHUNK, total)
+            stage(f"updating {label}: {done}/{total}")
+
+    stage(f"starting DB write: {len(attendance_to_insert)} inserts, "
           f"{len(attendance_updates)} updates, {len(recon_to_insert)} recon, "
           f"{len(actions_to_insert)} actions, {len(ot_to_insert)} OT rows")
-    if attendance_to_insert:
-        db.bulk_save_objects(attendance_to_insert)
-    if attendance_updates:
-        db.bulk_update_mappings(Attendance, attendance_updates)
-    if recon_to_insert:
-        db.bulk_save_objects(recon_to_insert)
-    if actions_to_insert:
-        db.bulk_save_objects(actions_to_insert)
-    if ot_to_insert:
-        db.bulk_save_objects(ot_to_insert)
+    _write_chunked(attendance_to_insert, "Attendance inserts")
+    _update_chunked(attendance_updates, "Attendance updates")
+    _write_chunked(recon_to_insert, "reconciliation rows")
+    _write_chunked(actions_to_insert, "HR actions")
+    _write_chunked(ot_to_insert, "overtime rows")
 
     stage("committing DB writes")
     db.commit()
