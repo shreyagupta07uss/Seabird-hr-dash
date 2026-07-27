@@ -1618,8 +1618,11 @@ def get_upload_history(db: Session = Depends(get_db)):
              "status": l.status, "uploaded_at": l.uploaded_at.isoformat()} for l in logs]
 
 @app.post("/api/v1/upload/master")
-async def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
-    contents = await file.read()
+def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+    # NOTE: sync `def` (not async) so Starlette runs this in a worker thread instead of
+    # blocking the single event loop for the whole upload - fixes ERR_HTTP2_PING_FAILED /
+    # "CORS" errors on large files, since the server can still answer keepalive pings.
+    contents = file.file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -1636,6 +1639,11 @@ async def upload_master(file: UploadFile = File(...), force: bool = Form(False),
     vendors_created = 0
     stores_created = 0
 
+    # Prefetch once instead of hitting the DB 3x per row (this was the main slowdown)
+    emp_by_pr = {e.pr_number: e for e in db.query(Employee).all() if e.pr_number}
+    existing_vendor_names = {v.name for v in db.query(Vendor.name).all()}
+    existing_store_names = {s.name for s in db.query(Store.name).all()}
+
     for row in rows:
         pr = str(row.get("PR", row.get("pr_number", row.get("PR Number", row.get("PR_Number", ""))))).strip()
         bio_val = row.get("Bio", row.get("BioID", None))
@@ -1649,15 +1657,16 @@ async def upload_master(file: UploadFile = File(...), force: bool = Form(False),
         if not pr:
             continue
 
-        if vendor_name and not db.query(Vendor).filter(Vendor.name == vendor_name).first():
+        if vendor_name and vendor_name not in existing_vendor_names:
             db.add(Vendor(name=vendor_name))
+            existing_vendor_names.add(vendor_name)
             vendors_created += 1
-        if store_name and not db.query(Store).filter(Store.name == store_name).first():
+        if store_name and store_name not in existing_store_names:
             db.add(Store(name=store_name, location=store_name))
+            existing_store_names.add(store_name)
             stores_created += 1
-        db.flush()
 
-        emp = db.query(Employee).filter(Employee.pr_number == pr).first()
+        emp = emp_by_pr.get(pr)
         if emp:
             emp.bio_id = bio_id or emp.bio_id
             emp.name = name or emp.name
@@ -1668,7 +1677,7 @@ async def upload_master(file: UploadFile = File(...), force: bool = Form(False),
             emp.status = normalize_employee_status(status_val) if status_val else emp.status
             emp.join_date = parse_date_br(row.get("DOJ", row.get("doj", ""))) or emp.join_date
         else:
-            db.add(Employee(
+            new_emp = Employee(
                 pr_number=pr, bio_id=bio_id, emp_code="", name=name or pr,
                 vendor=vendor_name, store=store_name, department="",
                 designation=str(row.get("Designation", row.get("designation", ""))).strip(),
@@ -1676,7 +1685,9 @@ async def upload_master(file: UploadFile = File(...), force: bool = Form(False),
                 wc=category, bc="",
                 status=normalize_employee_status(status_val),
                 join_date=parse_date_br(row.get("DOJ", row.get("doj", "")))
-            ))
+            )
+            db.add(new_emp)
+            emp_by_pr[pr] = new_emp  # so a duplicate PR later in the same file updates, not re-inserts
         processed += 1
 
     db.commit()
@@ -1686,11 +1697,11 @@ async def upload_master(file: UploadFile = File(...), force: bool = Form(False),
             "vendors_created": vendors_created, "stores_created": stores_created, "filename": file.filename}
 
 @app.post("/api/v1/upload/essl")
-async def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
     import time as time_module
     start_time = time_module.time()
 
-    contents = await file.read()
+    contents = file.file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -2042,8 +2053,13 @@ async def upload_essl(file: UploadFile = File(...), force: bool = Form(False), d
     }
 
 @app.post("/api/v1/upload/tata")
-async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
-    contents = await file.read()
+def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+    # NOTE: sync `def` (not async) so this runs in a worker thread, not the event loop -
+    # fixes ERR_HTTP2_PING_FAILED / misleading "CORS" errors on large 30-sheet files.
+    import time as time_module
+    start_time = time_module.time()
+
+    contents = file.file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -2059,36 +2075,76 @@ async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), d
         db.commit()
         raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
 
-    processed = 0
+    # Prefetch every employee ONCE instead of up to 3 SELECTs per row (this was the
+    # main cause of the timeout - a 30-sheet file could mean 30,000+ rows x 3 queries).
+    all_employees = db.query(Employee).all()
+    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
+    emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
+    emp_by_name = {e.name.strip().upper(): e for e in all_employees if e.name}
+
+    def resolve_employee_fast(paycode: str, emp_name_val: str):
+        e = emp_by_pr.get(paycode)
+        if e:
+            return e
+        e = emp_by_code.get(paycode)
+        if e:
+            return e
+        if emp_name_val:
+            return emp_by_name.get(emp_name_val.strip().upper())
+        return None
+
+    # Pass 1: parse all rows in memory (no DB calls yet), track which dates are touched.
+    parsed = []
+    all_dates = set()
     for row in rows:
         paycode = str(row.get("PayCode", row.get("Pay Code", row.get("paycode", "")))).strip()
-        emp_name = str(row.get("Employee Name", row.get("EMP Name", row.get("EmployeeName", "")))).strip()
         att_date = parse_date_br(row.get("Date", row.get("date", "")))
-        in_time = safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", "")))))
-        out_time = safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", "")))))
-        man_hrs = float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0)
-        status_val = str(row.get("Status", row.get("status", "P"))).strip().upper()
-        dept_from_row = str(row.get("Department", row.get("department", ""))).strip()
-        division_from_row = str(row.get("Division", "")).strip()
-
         if not paycode or not att_date:
             continue
+        parsed.append({
+            "paycode": paycode,
+            "emp_name": str(row.get("Employee Name", row.get("EMP Name", row.get("EmployeeName", "")))).strip(),
+            "att_date": att_date,
+            "in_time": safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", ""))))),
+            "out_time": safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", ""))))),
+            "man_hrs": float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0),
+            "status_val": str(row.get("Status", row.get("status", "P"))).strip().upper(),
+            "dept_from_row": str(row.get("Department", row.get("department", ""))).strip(),
+            "division_from_row": str(row.get("Division", "")).strip(),
+            "row_shift_raw": row.get("Shift", row.get("Shift In Time", None)),
+            "category_raw": str(row.get("WC/BC", "")).strip(),
+            "contractor_raw": str(row.get("Contractor", "")).strip(),
+            "store_raw": str(row.get("Store", "")).strip(),
+            "early_going": str(row.get("Early Going", "")).strip(),
+            "shift_late": str(row.get("Shift Late", "")).strip(),
+        })
+        all_dates.add(att_date)
 
-        emp = db.query(Employee).filter(Employee.pr_number == paycode).first()
-        if not emp:
-            emp = db.query(Employee).filter(Employee.emp_code == paycode).first()
-        if not emp and emp_name:
-            emp = db.query(Employee).filter(func.upper(Employee.name) == emp_name.strip().upper()).first()
+    # Pass 2: bulk-fetch existing TataAttendance rows for just the date range touched
+    # (ONE query instead of one SELECT per row).
+    existing_map = {}
+    if parsed:
+        min_date, max_date = min(all_dates), max(all_dates)
+        for rec in db.query(TataAttendance).filter(TataAttendance.date >= min_date, TataAttendance.date <= max_date).all():
+            existing_map[(rec.pr_number, rec.date)] = rec
 
+    processed = 0
+    pending_inserts = {}  # key -> row dict, for new rows not yet in the DB or existing_map
+
+    for item in parsed:
+        paycode = item["paycode"]; att_date = item["att_date"]
+        in_time = item["in_time"]; out_time = item["out_time"]; man_hrs = item["man_hrs"]
+        status_val = item["status_val"]; dept_from_row = item["dept_from_row"]; division_from_row = item["division_from_row"]
+
+        emp = resolve_employee_fast(paycode, item["emp_name"])
         pr_number = emp.pr_number if emp else paycode
 
-        row_shift_raw = row.get("Shift", row.get("Shift In Time", None))
-        if row_shift_raw:
-            shift = safe_shift(str(row_shift_raw))
+        if item["row_shift_raw"]:
+            shift = safe_shift(str(item["row_shift_raw"]))
         else:
             shift = emp.shift if emp else "G"
 
-        category = normalize_category(str(row.get("WC/BC", ""))).strip() or (emp.wc if emp else "BC")
+        category = normalize_category(item["category_raw"]).strip() or (emp.wc if emp else "BC")
         if category == "":
             category = emp.wc if emp else "BC"
 
@@ -2103,8 +2159,9 @@ async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), d
         if status_val not in ["P", "A", "L", "HD", "WO", "SP"]:
             status_val = "P" if (in_time or out_time or man_hrs > 0) else "A"
 
-        existing_tata = db.query(TataAttendance).filter(TataAttendance.pr_number == pr_number, TataAttendance.date == att_date).first()
         ot_result = calculate_ot(shift, category, in_time, out_time, man_hrs)
+        key = (pr_number, att_date)
+        existing_tata = existing_map.get(key)
 
         if existing_tata:
             existing_tata.in_time = safe_time(in_time) or existing_tata.in_time
@@ -2114,31 +2171,43 @@ async def upload_tata(file: UploadFile = File(...), force: bool = Form(False), d
             existing_tata.ot_hours = ot_result["calculated_ot_hours"]
             existing_tata.shift = safe_shift(shift)
             existing_tata.department = dept_from_row or division_from_row or existing_tata.department
+        elif key in pending_inserts:
+            # duplicate paycode+date appearing again later in the same file - update in place
+            pend = pending_inserts[key]
+            pend["in_time"] = safe_time(in_time) or pend["in_time"]
+            pend["out_time"] = safe_time(out_time) or pend["out_time"]
+            pend["man_hrs"] = man_hrs if man_hrs > 0 else pend["man_hrs"]
+            pend["status"] = status_val
+            pend["ot_hours"] = ot_result["calculated_ot_hours"]
+            pend["shift"] = safe_shift(shift)
+            pend["department"] = dept_from_row or division_from_row or pend["department"]
         else:
-            db.add(TataAttendance(
-                employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=emp_name,
+            pending_inserts[key] = dict(
+                employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=item["emp_name"],
                 date=att_date, in_time=safe_time(in_time), out_time=safe_time(out_time), man_hrs=man_hrs, status=status_val,
                 ot_hours=ot_result["calculated_ot_hours"],
-                early_going=str(row.get("Early Going", "")).strip(), shift_late=str(row.get("Shift Late", "")).strip(),
-                vendor=normalize_vendor(str(row.get("Contractor", emp.vendor if emp else ""))),
-                store=str(row.get("Store", emp.store if emp else "")).strip(),
+                early_going=item["early_going"], shift_late=item["shift_late"],
+                vendor=normalize_vendor(item["contractor_raw"] or (emp.vendor if emp else "")),
+                store=item["store_raw"] or (emp.store if emp else ""),
                 department=dept_from_row or division_from_row or (emp.department if emp else ""),
                 shift=safe_shift(shift)
-            ))
+            )
         processed += 1
-        if processed % 500 == 0:
-            db.commit()
+
+    if pending_inserts:
+        db.execute(TataAttendance.__table__.insert(), list(pending_inserts.values()))
 
     db.commit()
     db.add(UploadLog(file_type="tata", filename=file.filename, file_hash=file_hash, rows_processed=processed, status="Success"))
     db.commit()
+    elapsed = round(time_module.time() - start_time, 2)
     return {"status": "success", "type": "tata", "rows_processed": processed,
-            "sheets_read": sheets_read, "sheets_skipped": sheets_skipped,
+            "sheets_read": sheets_read, "sheets_skipped": sheets_skipped, "elapsed_seconds": elapsed,
             "filename": file.filename, "message": "Official attendance stored. Ready for reconciliation."}
 
 @app.post("/api/v1/upload/tata-all")
-async def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
-    contents = await file.read()
+def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+    contents = file.file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -2179,12 +2248,18 @@ async def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False
         monthly_data[key]["total_ot"] += ot
         processed += 1
 
+    # Prefetch existing monthly rows for just the year-months touched (one query instead
+    # of one SELECT per unique employee/month key).
+    year_months_touched = {ym for (_, ym) in monthly_data.keys()}
+    existing_monthly_map = {}
+    if year_months_touched:
+        for rec in db.query(MonthlyTataAttendance).filter(MonthlyTataAttendance.year_month.in_(year_months_touched)).all():
+            existing_monthly_map[(rec.pr_number, rec.year_month)] = rec
+
     for key, data in monthly_data.items():
         total_days = data["present"] + data["absent"] + data["leave"] + data["weekoff"] + data["half_day"]
         att_pct = (data["present"] / total_days * 100) if total_days > 0 else 0
-        existing_monthly = db.query(MonthlyTataAttendance).filter(
-            MonthlyTataAttendance.pr_number == data["pr"], MonthlyTataAttendance.year_month == data["year_month"]
-        ).first()
+        existing_monthly = existing_monthly_map.get(key)
         if existing_monthly:
             existing_monthly.present_days = data["present"]; existing_monthly.absent_days = data["absent"]
             existing_monthly.leave_days = data["leave"]; existing_monthly.weekoff_days = data["weekoff"]
@@ -2241,13 +2316,13 @@ def _parse_essl_side_sheet(ws) -> Dict[str, Dict[str, Any]]:
     return out
 
 @app.post("/api/v1/upload/daywise")
-async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
+def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
     """Single-day combined upload: one workbook with 'Essl In', 'Essl Out', and 'Tata'
     sheets (exactly the format HR pulls each day). ESSL sheets carry one time column per
     day (header like '22 W'), which doesn't carry an unambiguous date on its own, so the
     date is taken from the Tata sheet's own Date column unless target_date is passed
     explicitly (accepts 'DD/MM/YYYY' or 'YYYY-MM-DD')."""
-    contents = await file.read()
+    contents = file.file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
     if not force:
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
@@ -2337,6 +2412,9 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
         db.commit()
 
     # ---- Tata (same upsert logic as /api/v1/upload/tata, scoped to this file) ----
+    existing_tata_map = {
+        rec.pr_number: rec for rec in db.query(TataAttendance).filter(TataAttendance.date == resolved_date).all()
+    }
     tata_processed = 0
     for row in tata_rows:
         paycode = str(row.get("PayCode", row.get("Pay Code", ""))).strip()
@@ -2372,7 +2450,7 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
         if status_val not in ["P", "A", "L", "HD", "WO", "SP"]:
             status_val = "P" if (in_time or out_time or man_hrs > 0) else "A"
 
-        existing_tata = db.query(TataAttendance).filter(TataAttendance.pr_number == pr_number, TataAttendance.date == att_date).first()
+        existing_tata = existing_tata_map.get(pr_number)
         ot_result = calculate_ot(shift, category, in_time, out_time, man_hrs)
 
         if existing_tata:
@@ -2384,7 +2462,7 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
             existing_tata.shift = safe_shift(shift)
             existing_tata.department = dept_from_row or division_from_row or existing_tata.department
         else:
-            db.add(TataAttendance(
+            new_tata = TataAttendance(
                 employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=emp_name,
                 date=att_date, in_time=safe_time(in_time), out_time=safe_time(out_time), man_hrs=man_hrs, status=status_val,
                 ot_hours=ot_result["calculated_ot_hours"],
@@ -2393,10 +2471,10 @@ async def upload_daywise(file: UploadFile = File(...), target_date: Optional[str
                 store=str(row.get("Store", emp.store if emp else "")).strip(),
                 department=dept_from_row or division_from_row or (emp.department if emp else ""),
                 shift=safe_shift(shift)
-            ))
+            )
+            db.add(new_tata)
+            existing_tata_map[pr_number] = new_tata  # guard against a dup paycode later in the same file
         tata_processed += 1
-        if tata_processed % 500 == 0:
-            db.commit()
 
     try:
         db.commit()
