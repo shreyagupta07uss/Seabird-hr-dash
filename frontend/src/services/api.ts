@@ -656,11 +656,13 @@ export const api = {
     // legitimately take longer than that. This starts the job, then polls for
     // completion, so no single request is ever left open long enough to hit it.
     //
-    // onProgress (optional) is called with "running" on every poll, so the UI can
-    // show a spinner/status message instead of looking frozen for a couple minutes.
+    // onProgress (optional) is called on every poll with the backend's current
+    // stage (e.g. "prefetching Tata data", "processed 14 day(s) in memory...",
+    // "writing to DB: ...") so the UI can show what's actually happening instead
+    // of a generic spinner that looks frozen for a couple minutes.
     runReconciliationMonth: async (
         month: string,
-        onProgress?: (status: string) => void
+        onProgress?: (stage: string) => void
     ): Promise<{
         status: string; month: string; days_processed: number;
         attendance_records_created: number; reconciliation_issues: number; hr_actions_created: number;
@@ -681,7 +683,7 @@ export const api = {
             if (Date.now() - startedAt > MAX_WAIT_MS) {
                 throw new Error(
                     `Reconciliation is still running after ${Math.round(MAX_WAIT_MS / 60000)} minutes. ` +
-                    `It hasn't failed - check back later or refresh, job_id: ${job_id}`
+                    `It hasn't failed - check back later, or check job_id ${job_id} directly.`
                 );
             }
 
@@ -689,12 +691,13 @@ export const api = {
 
             const job = await fetchJSON<{
                 status: 'running' | 'completed' | 'failed';
+                stage?: string;
                 result: any;
                 error: string | null;
             }>(`${API_BASE}/reconciliation/run-month/${job_id}`);
 
             if (job.status === 'running') {
-                onProgress?.('running');
+                onProgress?.(job.stage || 'running');
                 continue;
             }
             if (job.status === 'failed') {

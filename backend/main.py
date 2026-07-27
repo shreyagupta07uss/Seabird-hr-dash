@@ -2997,6 +2997,8 @@ def start_reconciliation_month(month: str = Form(...)):
             "job_id": job_id,
             "month": month,
             "status": "running",
+            "stage": "queued",
+            "stage_at": datetime.utcnow().isoformat(),
             "result": None,
             "error": None,
             "started_at": datetime.utcnow().isoformat(),
@@ -3005,8 +3007,15 @@ def start_reconciliation_month(month: str = Form(...)):
 
     def _worker():
         worker_db = SessionLocal()
+        started = datetime.utcnow()
+
+        def on_stage(stage: str):
+            elapsed = (datetime.utcnow() - started).total_seconds()
+            print(f"[RECONCILIATION JOB {job_id}] {stage} (+{elapsed:.1f}s)")
+            _set_job(job_id, stage=stage, stage_at=datetime.utcnow().isoformat())
+
         try:
-            result = _run_reconciliation_month_logic(month, worker_db)
+            result = _run_reconciliation_month_logic(month, worker_db, on_stage=on_stage)
             _set_job(job_id, status="completed", result=result,
                       finished_at=datetime.utcnow().isoformat())
         except Exception as e:
@@ -3034,10 +3043,16 @@ def get_reconciliation_month_status(job_id: str):
 
 
 # FIX v3.2: Completely rewritten with bulk pre-fetch to eliminate timeout
-def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
+def _run_reconciliation_month_logic(month: str, db: Session, on_stage=None) -> Dict[str, Any]:
+    def stage(name: str):
+        if on_stage:
+            on_stage(name)
+
     year, mon = parse_year_month(month)
     start = date(year, mon, 1)
     end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+
+    stage("fetching employees")
 
     employees = db.query(Employee).all()
     emp_ids = [e.id for e in employees]
@@ -3046,6 +3061,7 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
     pr_numbers = [e.pr_number for e in employees]
 
     # FIX v3.2: Pre-fetch ALL data for the ENTIRE month in 5 bulk queries
+    stage(f"prefetching ESSL data ({len(pr_numbers)} employees)")
     all_essl = db.query(ESSLAttendance).filter(
         ESSLAttendance.pr_number.in_(pr_numbers),
         ESSLAttendance.date >= start,
@@ -3056,6 +3072,7 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
         key = (e.pr_number, e.date.isoformat())
         essl_map[key] = e
 
+    stage("prefetching Tata data")
     all_tata = db.query(TataAttendance).filter(
         TataAttendance.pr_number.in_(pr_numbers),
         TataAttendance.date >= start,
@@ -3071,6 +3088,7 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
     tata_prs_month = set(t.pr_number for t in all_tata if t.pr_number)
     tata_only_prs = tata_prs_month - essl_prs_month
 
+    stage("prefetching existing Attendance rows")
     all_att = db.query(Attendance).filter(
         Attendance.pr_number.in_(pr_numbers),
         Attendance.date >= start,
@@ -3081,6 +3099,7 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
         key = (a.pr_number, a.date.isoformat())
         att_map[key] = a
 
+    stage("prefetching reconciliation rows")
     all_recon = db.query(AttendanceReconciliation).filter(
         AttendanceReconciliation.pr_number.in_(pr_numbers),
         AttendanceReconciliation.date >= start,
@@ -3091,6 +3110,7 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
         key = (r.pr_number, r.date.isoformat())
         recon_map[key] = r
 
+    stage("prefetching HR actions")
     all_actions = db.query(HRAction).filter(
         HRAction.pr_number.in_(pr_numbers),
         HRAction.date >= start,
@@ -3101,6 +3121,7 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
         key = (a.pr_number, a.date.isoformat(), a.action_type)
         action_map[key] = a
 
+    stage("prefetching overtime rows")
     all_ot = db.query(Overtime).filter(
         Overtime.pr_number.in_(pr_numbers),
         Overtime.date >= start,
@@ -3111,6 +3132,7 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
         key = (o.pr_number, o.date.isoformat())
         ot_map[key] = o
 
+    stage(f"processing {len(pr_numbers)} employees x days in memory")
     # Process entirely in memory
     attendance_to_insert = []
     attendance_updates = []  # dicts for bulk_update_mappings - see note below
@@ -3437,6 +3459,8 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
                     totals["hr_actions_created"] += 1
 
         days_processed += 1
+        stage(f"processed {days_processed} day(s) in memory "
+              f"({len(attendance_to_insert)} new, {len(attendance_updates)} updates so far)")
         d += timedelta(days=1)
 
     # FIX v3.2: Bulk insert everything at once
@@ -3446,6 +3470,9 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
     # issue one individual UPDATE per row at commit() - very slow, especially on
     # Railway's disk. bulk_update_mappings() below does it as a handful of fast
     # batched statements instead.
+    stage(f"writing to DB: {len(attendance_to_insert)} inserts, "
+          f"{len(attendance_updates)} updates, {len(recon_to_insert)} recon, "
+          f"{len(actions_to_insert)} actions, {len(ot_to_insert)} OT rows")
     if attendance_to_insert:
         db.bulk_save_objects(attendance_to_insert)
     if attendance_updates:
@@ -3457,8 +3484,10 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
     if ot_to_insert:
         db.bulk_save_objects(ot_to_insert)
 
+    stage("committing DB writes")
     db.commit()
 
+    stage("checking OT thresholds")
     # Post-process: Check OT thresholds for employees who accrued OT this month.
     # FIX: this used to call check_ot_thresholds() - 2 SUM queries + up to 2 existence
     # queries - once per employee PER DAY that had OT. For a full month with many
@@ -3532,6 +3561,7 @@ def _run_reconciliation_month_logic(month: str, db: Session) -> Dict[str, Any]:
             db.bulk_save_objects(threshold_actions_to_insert)
             db.commit()
 
+    stage("done")
     return {
         "status": "completed",
         "month": month,
