@@ -4,6 +4,8 @@ import {
     Settings, ChevronLeft, Search, Bell, Menu, ChevronRight,
     Zap, ArrowRightLeft, Sparkles, UserSearch, LogOut
 } from 'lucide-react';
+import { ShieldAlert } from "lucide-react";
+import { Route } from 'react-router-dom';
 import { useAuth } from './context/AuthContext';
 import { BrowserRouter } from "react-router-dom";
 import { AuthProvider } from './context/AuthContext';
@@ -18,8 +20,9 @@ import Reports from './components/Reports';
 import AIAnalytics from './components/AIAnalytics';
 import EmployeeSummary from './components/EmployeeSummary';
 import { ToastContainer } from './components/SharedUI';
+import OTThresholdAlerts from "./components/OTThresholdAlerts";
 
-type TabId = 'dashboard' | 'attendance' | 'reconciliation' | 'employees' | 'vendors' | 'stores' | 'departments' | 'shifts' | 'overtime' | 'reports' | 'upload' | 'actions' | 'settings' | 'aianalytics' | 'employee-summary';
+type TabId = 'dashboard' | 'attendance' | 'reconciliation' | 'employees' | 'vendors' | 'stores' | 'departments' | 'shifts' | 'overtime' | 'reports' | 'upload' | 'actions' | 'settings' | 'aianalytics' | 'employee-summary' | 'ot-alerts';
 
 interface SidebarItem {
     id: TabId;
@@ -40,6 +43,7 @@ const SIDEBAR_ITEMS: SidebarItem[] = [
     { id: 'aianalytics', label: 'AI Analytics', icon: Sparkles, category: 'Operations' },
     { id: 'employee-summary', label: 'Employee Summary', icon: UserSearch, category: 'Operations' },
     { id: 'settings', label: 'Settings', icon: Settings },
+    { id: 'ot-alerts', label: 'OT Alerts', icon: ShieldAlert, category: 'Operations' },
 ];
 
 export default function App() {
@@ -113,6 +117,7 @@ function AppContent() {
             case 'aianalytics': return <AIAnalytics />;
             case 'employee-summary': return <EmployeeSummary initialPR={employeeSummaryPR} />;
             case 'settings': return <Reports />;
+            case 'ot-alerts': return <OTThresholdAlerts />;
             default: return <Dashboard />;
         }
     };

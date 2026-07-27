@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
     TrendingDown, UserCheck, UserX, Clock4,
     Zap, BarChart3, AlertTriangle, Users, Clock, Upload, Download, ArrowRightLeft, Calendar,
-    Activity, Briefcase, MapPin, Layers, CheckCircle2
+    Activity, Briefcase, MapPin, Layers, CheckCircle2, ShieldAlert
 } from 'lucide-react';
 import {
     AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
@@ -13,6 +13,9 @@ import {
     KPICard, SectionHeader, LoadingSpinner, ErrorState,
     PriorityBadge, Button, Card
 } from './SharedUI';
+import OTThresholdCard from "../components/OTThresholdCard";
+import { useNavigate } from "react-router-dom";
+
 
 // Custom tooltip for charts
 const CustomTooltip = ({ active, payload, label }: any) => {
@@ -71,6 +74,7 @@ function formatHours(decimalHours: number | null | undefined): string {
 }
 
 export default function Dashboard() {
+    const navigate = useNavigate();
     const [selectedDate, setSelectedDate] = useState<string>("");
     const [kpis, setKpis] = useState<KPIData | null>(null);
     const [trends, setTrends] = useState<TrendData[]>([]);
@@ -238,12 +242,13 @@ export default function Dashboard() {
             </div>
 
             {/* Secondary KPI Row */}
-            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
                 <MiniKPICard title="Early Departure" value={kpis?.early_departure ?? 0} icon={TrendingDown} color="text-orange-500" />
                 <MiniKPICard title="Single Punch" value={kpis?.single_punch ?? 0} icon={AlertTriangle} color="text-purple-500" />
                 <MiniKPICard title="Alternate Shift" value={kpis?.alternate_shift ?? 0} icon={ArrowRightLeft} color="text-orange-500" />
                 <MiniKPICard title="New Joinees" value={kpis?.new_joiners ?? 0} icon={Briefcase} color="text-teal-500" />
                 <MiniKPICard title="No Data" value={kpis?.no_data ?? 0} icon={Activity} color="text-slate-500" />
+                <OTThresholdCard month={selectedDate?.slice(0, 7)} onClick={() => navigate("/ot-alerts")} />
             </div>
 
             {/* Charts Row */}
