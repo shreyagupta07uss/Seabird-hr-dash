@@ -1,13 +1,23 @@
 import { useState, useEffect } from "react";
-import { AlertTriangle, Clock, Calendar, RefreshCw, ShieldAlert } from "lucide-react";
+import { AlertTriangle, Clock, Calendar, RefreshCw, ShieldAlert, ChevronLeft, ChevronRight } from "lucide-react";
 import { getOTThresholdAlerts, getOTThresholdSummary, calculateOTThresholdAlerts, OTThresholdAlert } from "../services/otThresholdApi";
 
 interface OTThresholdAlertsProps {
   month?: string;
 }
 
+function getMonthInputValue(d: Date): string {
+  return d.toISOString().slice(0, 7);
+}
+
+function shiftMonth(monthStr: string, delta: number): string {
+  const [y, m] = monthStr.split("-").map(Number);
+  const d = new Date(y, m - 1 + delta, 1);
+  return getMonthInputValue(d);
+}
+
 export default function OTThresholdAlerts({ month }: OTThresholdAlertsProps) {
-  const targetMonth = month || new Date().toISOString().slice(0, 7);
+  const [selectedMonth, setSelectedMonth] = useState(month || getMonthInputValue(new Date()));
   const [alerts, setAlerts] = useState<OTThresholdAlert[]>([]);
   const [summary, setSummary] = useState({ weekly_breaches: 0, monthly_breaches: 0, total_breaches: 0 });
   const [loading, setLoading] = useState(false);
@@ -19,8 +29,8 @@ export default function OTThresholdAlerts({ month }: OTThresholdAlertsProps) {
     setError("");
     try {
       const [alertsRes, summaryRes] = await Promise.all([
-        getOTThresholdAlerts(targetMonth),
-        getOTThresholdSummary(targetMonth),
+        getOTThresholdAlerts(selectedMonth),
+        getOTThresholdSummary(selectedMonth),
       ]);
       setAlerts(alertsRes.data || []);
       setSummary(summaryRes);
@@ -35,7 +45,7 @@ export default function OTThresholdAlerts({ month }: OTThresholdAlertsProps) {
     setCalculating(true);
     setError("");
     try {
-      await calculateOTThresholdAlerts(targetMonth);
+      await calculateOTThresholdAlerts(selectedMonth);
       await fetchData();
     } catch (err: any) {
       setError(err.message || "Failed to calculate OT alerts");
@@ -46,15 +56,15 @@ export default function OTThresholdAlerts({ month }: OTThresholdAlertsProps) {
 
   useEffect(() => {
     fetchData();
-  }, [targetMonth]);
+  }, [selectedMonth]);
 
   const weeklyAlerts = alerts.filter((a) => a.action_type === "OT Weekly Threshold");
   const monthlyAlerts = alerts.filter((a) => a.action_type === "OT Monthly Threshold");
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+      {/* Header + Month Selector */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h2 className="text-xl font-semibold text-slate-800 flex items-center gap-2">
             <ShieldAlert className="w-5 h-5 text-amber-500" />
@@ -64,14 +74,43 @@ export default function OTThresholdAlerts({ month }: OTThresholdAlertsProps) {
             Weekly limit: 12 hrs | Monthly limit: 48 hrs
           </p>
         </div>
-        <button
-          onClick={handleCalculate}
-          disabled={calculating}
-          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 text-sm font-medium transition-colors"
-        >
-          <RefreshCw className={`w-4 h-4 ${calculating ? "animate-spin" : ""}`} />
-          {calculating ? "Calculating..." : "Recalculate Alerts"}
-        </button>
+
+        <div className="flex items-center gap-2">
+          {/* Month Navigator */}
+          <div className="flex items-center bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
+            <button
+              onClick={() => setSelectedMonth(shiftMonth(selectedMonth, -1))}
+              className="px-2 py-2 hover:bg-slate-50 text-slate-500 transition-colors"
+              title="Previous month"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <div className="px-1">
+              <input
+                type="month"
+                value={selectedMonth}
+                onChange={(e) => setSelectedMonth(e.target.value)}
+                className="text-sm font-medium text-slate-700 bg-transparent border-none outline-none py-2 px-1 cursor-pointer"
+              />
+            </div>
+            <button
+              onClick={() => setSelectedMonth(shiftMonth(selectedMonth, 1))}
+              className="px-2 py-2 hover:bg-slate-50 text-slate-500 transition-colors"
+              title="Next month"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+
+          <button
+            onClick={handleCalculate}
+            disabled={calculating}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 text-sm font-medium transition-colors shadow-sm"
+          >
+            <RefreshCw className={`w-4 h-4 ${calculating ? "animate-spin" : ""}`} />
+            {calculating ? "Calculating..." : "Recalculate"}
+          </button>
+        </div>
       </div>
 
       {/* Summary Cards */}
@@ -112,7 +151,7 @@ export default function OTThresholdAlerts({ month }: OTThresholdAlertsProps) {
               <AlertTriangle className="w-5 h-5 text-slate-500" />
             </div>
           </div>
-          <p className="text-xs text-slate-400 mt-2">For {targetMonth}</p>
+          <p className="text-xs text-slate-400 mt-2">For {selectedMonth}</p>
         </div>
       </div>
 
@@ -133,7 +172,7 @@ export default function OTThresholdAlerts({ month }: OTThresholdAlertsProps) {
           <div className="p-8 text-center text-slate-400 text-sm">Loading alerts...</div>
         ) : alerts.length === 0 ? (
           <div className="p-8 text-center text-slate-400 text-sm">
-            No OT threshold breaches for {targetMonth}
+            No OT threshold breaches for {selectedMonth}
           </div>
         ) : (
           <div className="overflow-x-auto">
