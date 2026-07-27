@@ -86,20 +86,27 @@ export default function Dashboard() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
-    const loadData = async () => {
-        if (!selectedDate) return;
+    // PERF FIX: requestIdRef guards against stale responses - if the date is
+    // changed again before an in-flight load finishes, the older response is
+    // discarded instead of overwriting newer data on the screen.
+    const requestIdRef = React.useRef(0);
+
+    const loadData = async (dateToLoad: string) => {
+        if (!dateToLoad) return;
+        const myRequestId = ++requestIdRef.current;
         try {
             setLoading(true);
             setError(null);
             const [k, t, v, s, d, sh, a] = await Promise.all([
-                api.getKPIs(selectedDate),
-                api.getTrends(selectedDate, 30),
-                api.getBreakdown('vendors', selectedDate),
-                api.getBreakdown('stores', selectedDate),
-                api.getBreakdown('departments', selectedDate),
-                api.getBreakdown('shifts', selectedDate),
+                api.getKPIs(dateToLoad),
+                api.getTrends(dateToLoad, 30),
+                api.getBreakdown('vendors', dateToLoad),
+                api.getBreakdown('stores', dateToLoad),
+                api.getBreakdown('departments', dateToLoad),
+                api.getBreakdown('shifts', dateToLoad),
                 api.getActionQueue()
             ]);
+            if (myRequestId !== requestIdRef.current) return; // a newer request superseded this one
             setKpis(k);
             // FIX: Parse trend data correctly - API returns { trends: [...] }
             setTrends(Array.isArray(t) ? t : ((t as any).trends || []));
@@ -109,16 +116,20 @@ export default function Dashboard() {
             setShifts(sh);
             setActions(a.data || []);
         } catch (err: any) {
+            if (myRequestId !== requestIdRef.current) return;
             setError(err.message || "Failed to load dashboard data");
         } finally {
-            setLoading(false);
+            if (myRequestId === requestIdRef.current) setLoading(false);
         }
     };
 
+    // PERF FIX: debounce date changes by 300ms so clicking through the date
+    // picker (or a fast back-to-back change) doesn't fire 7 parallel requests
+    // per keystroke - only the final date after the user pauses gets loaded.
     useEffect(() => {
-        if (selectedDate) {
-            loadData();
-        }
+        if (!selectedDate) return;
+        const timer = setTimeout(() => loadData(selectedDate), 300);
+        return () => clearTimeout(timer);
     }, [selectedDate]);
 
     // Set default date to yesterday on mount
@@ -129,7 +140,7 @@ export default function Dashboard() {
     }, []);
 
     if (loading) return <LoadingSpinner />;
-    if (error) return <ErrorState message={error} onRetry={loadData} />;
+    if (error) return <ErrorState message={error} onRetry={() => loadData(selectedDate)} />;
 
     // Prepare pie chart data for attendance distribution
     const attendancePieData = kpis ? [

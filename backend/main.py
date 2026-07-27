@@ -63,7 +63,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload
 
 from openpyxl import load_workbook
 
@@ -99,7 +99,7 @@ else:
         DATABASE_URL,
         pool_pre_ping=True,      # verify connection before use
         pool_recycle=300,        # recycle every 5 min (Neon drops idle >5min)
-        pool_size=3,             # Neon free tier = 10 max concurrent
+        pool_size=6,             # Neon free tier = 10 max concurrent; Dashboard fires up to 7 parallel requests per load
         max_overflow=2,          # allow 2 extra temporarily
         pool_timeout=30,         # wait up to 30s for a connection
         connect_args={"sslmode": "require"} if "sslmode" not in DATABASE_URL else {}
@@ -1075,7 +1075,11 @@ def get_kpis(target_date: str = Query(...), db: Session = Depends(get_db)):
 
     total_employees = db.query(Employee).count()  # FIX v3.2.8: Count ALL master employees
 
-    attendance_records = db.query(Attendance).filter(Attendance.date == today).all()
+    # PERF FIX: joinedload eager-loads employee in the same query. Previously,
+    # a.employee below triggered a separate SELECT per attendance row (N+1) -
+    # with hundreds of present employees that was hundreds of extra round trips
+    # on every KPI card load.
+    attendance_records = db.query(Attendance).options(joinedload(Attendance.employee)).filter(Attendance.date == today).all()
     present = sum(1 for a in attendance_records if a.attendance_status not in ["Absent", "Leave", "Week Off"])
     # FIX v3.2.7: Count both Absent and Week Off in absent
     absent = sum(1 for a in attendance_records if a.attendance_status in ["Absent", "Week Off"])
@@ -1185,135 +1189,138 @@ def get_trends(target_date: str = Query(...), days: int = Query(30, ge=1, le=90)
         raise HTTPException(status_code=400, detail="Invalid target_date format. Use YYYY-MM-DD.")
     start_date = end_date - timedelta(days=days)
 
+    # PERF FIX: this used to run a fresh query PER DAY in the loop (2 queries x up
+    # to 90 days = up to 180 sequential round trips for one chart). Attendance.date
+    # is indexed, so pulling the whole range in one query and grouping in Python
+    # is both correct and dramatically faster.
+    from collections import defaultdict as _defaultdict
+    rows = db.query(
+        Attendance.date, Attendance.attendance_status, Attendance.late_minutes, Attendance.ot_hours
+    ).filter(Attendance.date >= start_date, Attendance.date <= end_date).all()
+
+    by_date = _defaultdict(lambda: {"present": 0, "absent": 0, "late_punches": 0, "ot_hours": 0.0})
+    for rec_date, status, late_minutes, ot_hours in rows:
+        bucket = by_date[rec_date]
+        if status not in ("Absent", "Leave", "Week Off"):
+            bucket["present"] += 1
+        if status in ("Absent", "Week Off"):
+            bucket["absent"] += 1
+        if late_minutes and late_minutes > 0:
+            bucket["late_punches"] += 1
+        bucket["ot_hours"] += (ot_hours or 0)
+
     result = []
     d = start_date
     while d <= end_date:
-        day_records = db.query(Attendance).filter(Attendance.date == d).all()
-        present = sum(1 for a in day_records if a.attendance_status not in ["Absent", "Leave", "Week Off"])
-        absent = sum(1 for a in day_records if a.attendance_status in ["Absent", "Week Off"])
-        late = sum(1 for a in day_records if a.late_minutes > 0)
-        ot = db.query(func.sum(Attendance.ot_hours)).filter(Attendance.date == d).scalar() or 0
-
+        b = by_date.get(d, {"present": 0, "absent": 0, "late_punches": 0, "ot_hours": 0.0})
         result.append({
             "date": d.isoformat(),
-            "present": present,
-            "absent": absent,
-            "late_punches": late,
-            "ot_hours": round(ot, 2)
+            "present": b["present"],
+            "absent": b["absent"],
+            "late_punches": b["late_punches"],
+            "ot_hours": round(b["ot_hours"], 2)
         })
         d += timedelta(days=1)
 
     return {"trends": result, "days": days, "target_date": end_date.isoformat()}
+
+# PERF FIX: the four breakdown endpoints below used to loop over every distinct
+# vendor/store/department/shift and fire 3 separate queries per group (count,
+# attendance list, OT sum) - e.g. 10 stores = 30 queries for one chart, x4
+# breakdown types = up to ~80-100 queries on a single dashboard load. Attendance
+# already carries vendor/store/department/shift columns directly (no join to
+# Employee needed for the day's stats), so this collapses to 2 queries total
+# per endpoint regardless of how many distinct groups exist.
+def _compute_group_breakdown(db: Session, field: str, today: date) -> Dict[str, Dict[str, Any]]:
+    from collections import defaultdict as _defaultdict
+    emp_col = getattr(Employee, field)
+    att_col = getattr(Attendance, field)
+
+    totals = dict(
+        db.query(emp_col, func.count(Employee.id))
+        .filter(emp_col.isnot(None))
+        .group_by(emp_col)
+        .all()
+    )
+
+    rows = db.query(att_col, Attendance.attendance_status, Attendance.late_minutes, Attendance.ot_hours) \
+        .filter(Attendance.date == today, att_col.isnot(None)).all()
+
+    agg = _defaultdict(lambda: {"present": 0, "absent": 0, "late": 0, "ot": 0.0})
+    for key, status, late_minutes, ot_hours in rows:
+        b = agg[key]
+        if status not in ("Absent", "Leave", "Week Off"):
+            b["present"] += 1
+        if status in ("Absent", "Week Off"):
+            b["absent"] += 1
+        if late_minutes and late_minutes > 0:
+            b["late"] += 1
+        b["ot"] += (ot_hours or 0)
+
+    result = {}
+    for name, total in totals.items():
+        b = agg.get(name, {"present": 0, "absent": 0, "late": 0, "ot": 0.0})
+        result[name] = {
+            "name": name,
+            "present": b["present"],
+            "absent": b["absent"],
+            "total": total,
+            "late": b["late"],
+            "ot": round(b["ot"], 1),
+            "percentage": round((b["present"] / total * 100), 1) if total > 0 else 0
+        }
+    return result
+
 
 @app.get("/api/v1/breakdown/stores")
 def get_store_breakdown(target_date: str = Query(...), db: Session = Depends(get_db)):
     today = parse_date_br(target_date)
     if not today:
         raise HTTPException(status_code=400, detail="Invalid target_date format. Use YYYY-MM-DD.")
-    stores = db.query(Employee.store).distinct().all()
-    result = []
-    for (s,) in stores:
-        if not s:
-            continue
-        total = db.query(Employee).filter(Employee.store == s).count()  # FIX v3.2.8: All employees
-        store_attendance = db.query(Attendance).join(Employee).filter(
-            Employee.store == s, Attendance.date == today
-        ).all()
-        present = sum(1 for a in store_attendance if a.attendance_status not in ["Absent", "Leave", "Week Off"])
-        absent = sum(1 for a in store_attendance if a.attendance_status in ["Absent", "Week Off"])
-        late = sum(1 for a in store_attendance if a.late_minutes > 0)
-        ot = db.query(func.sum(Attendance.ot_hours)).join(Employee).filter(Employee.store == s, Attendance.date == today).scalar() or 0
-        result.append({
-            "name": s,
-            "present": present,
-            "absent": absent,
-            "total": total,
-            "late": late,
-            "ot": round(ot, 1),
-            "percentage": round((present / total * 100), 1) if total > 0 else 0
-        })
-    return sorted(result, key=lambda x: x["present"], reverse=True)
+    breakdown = _compute_group_breakdown(db, "store", today)
+    return sorted(breakdown.values(), key=lambda x: x["present"], reverse=True)
 
 @app.get("/api/v1/breakdown/vendors")
 def get_vendor_breakdown(target_date: str = Query(...), db: Session = Depends(get_db)):
     today = parse_date_br(target_date)
     if not today:
         raise HTTPException(status_code=400, detail="Invalid target_date format. Use YYYY-MM-DD.")
-    vendors = db.query(Employee.vendor).distinct().all()
-    result = []
-    for (v,) in vendors:
-        if not v:
-            continue
-        total = db.query(Employee).filter(Employee.vendor == v).count()  # FIX v3.2.8: All employees
-        vendor_attendance = db.query(Attendance).join(Employee).filter(
-            Employee.vendor == v, Attendance.date == today
-        ).all()
-        present = sum(1 for a in vendor_attendance if a.attendance_status not in ["Absent", "Leave", "Week Off"])
-        absent = sum(1 for a in vendor_attendance if a.attendance_status in ["Absent", "Week Off"])
-        late = sum(1 for a in vendor_attendance if a.late_minutes > 0)
-        ot = db.query(func.sum(Attendance.ot_hours)).join(Employee).filter(Employee.vendor == v, Attendance.date == today).scalar() or 0
-        result.append({
-            "name": v,
-            "present": present,
-            "absent": absent,
-            "total": total,
-            "late": late,
-            "ot": round(ot, 1),
-            "percentage": round((present / total * 100), 1) if total > 0 else 0
-        })
-    return sorted(result, key=lambda x: x["present"], reverse=True)
+    breakdown = _compute_group_breakdown(db, "vendor", today)
+    return sorted(breakdown.values(), key=lambda x: x["present"], reverse=True)
 
 @app.get("/api/v1/breakdown/departments")
 def get_department_breakdown(target_date: str = Query(...), db: Session = Depends(get_db)):
     today = parse_date_br(target_date)
     if not today:
         raise HTTPException(status_code=400, detail="Invalid target_date format. Use YYYY-MM-DD.")
-    depts = db.query(Employee.department).distinct().all()
-    result = []
-    for (d,) in depts:
-        if not d: continue
-        total = db.query(Employee).filter(Employee.department == d).count()  # FIX v3.2.8: All employees
-        dept_attendance = db.query(Attendance).join(Employee).filter(
-            Employee.department == d, Attendance.date == today
-        ).all()
-        present = sum(1 for a in dept_attendance if a.attendance_status not in ["Absent", "Leave", "Week Off"])
-        ot = db.query(func.sum(Attendance.ot_hours)).join(Employee).filter(Employee.department == d, Attendance.date == today).scalar() or 0
-        result.append({"name": d, "present": present, "total": total, "ot": round(ot, 1)})
-    return result
+    breakdown = _compute_group_breakdown(db, "department", today)
+    return [{"name": b["name"], "present": b["present"], "total": b["total"], "ot": b["ot"]} for b in breakdown.values()]
 
 @app.get("/api/v1/breakdown/shifts")
 def get_shift_breakdown(target_date: str = Query(...), db: Session = Depends(get_db)):
     today = parse_date_br(target_date)
     if not today:
         raise HTTPException(status_code=400, detail="Invalid target_date format. Use YYYY-MM-DD.")
-    shifts = db.query(Employee.shift).distinct().all()
-    result = []
-    for (s,) in shifts:
-        if not s: continue
-        total = db.query(Employee).filter(Employee.shift == s).count()  # FIX v3.2.8: All employees
-        shift_attendance = db.query(Attendance).join(Employee).filter(
-            Employee.shift == s, Attendance.date == today
-        ).all()
-        present = sum(1 for a in shift_attendance if a.attendance_status not in ["Absent", "Leave", "Week Off"])
-        ot = db.query(func.sum(Attendance.ot_hours)).join(Employee).filter(Employee.shift == s, Attendance.date == today).scalar() or 0
-        result.append({"name": s, "present": present, "total": total, "ot": round(ot, 1)})
-    return result
+    breakdown = _compute_group_breakdown(db, "shift", today)
+    return [{"name": b["name"], "present": b["present"], "total": b["total"], "ot": b["ot"]} for b in breakdown.values()]
 
 @app.get("/api/v1/actions/summary")
 def get_action_summary(db: Session = Depends(get_db)):
-    rec = db.query(HRAction).filter(HRAction.action_type == "Reconciliation", HRAction.status == "Open").count()
-    single_punch = db.query(HRAction).filter(HRAction.action_type == "Single Punch", HRAction.status == "Open").count()
-    late = db.query(HRAction).filter(HRAction.action_type == "Late Punch", HRAction.status == "Open").count()
-    early = db.query(HRAction).filter(HRAction.action_type == "Early Departure", HRAction.status == "Open").count()
-    less_hrs = db.query(HRAction).filter(HRAction.action_type == "Less Working Hours", HRAction.status == "Open").count()
-    total = db.query(HRAction).filter(HRAction.status == "Open").count()
+    # PERF FIX: was 6 separate COUNT queries. One GROUP BY covers all action
+    # types, plus the total is just the sum (no extra query needed).
+    type_counts = dict(
+        db.query(HRAction.action_type, func.count(HRAction.id))
+        .filter(HRAction.status == "Open")
+        .group_by(HRAction.action_type)
+        .all()
+    )
     return {
-        "reconciliation": rec,
-        "single_punch": single_punch,
-        "late_punches": late,
-        "early_departure": early,
-        "less_working_hours": less_hrs,
-        "total_open": total
+        "reconciliation": type_counts.get("Reconciliation", 0),
+        "single_punch": type_counts.get("Single Punch", 0),
+        "late_punches": type_counts.get("Late Punch", 0),
+        "early_departure": type_counts.get("Early Departure", 0),
+        "less_working_hours": type_counts.get("Less Working Hours", 0),
+        "total_open": sum(type_counts.values())
     }
 
 @app.get("/api/v1/actions/queue")
@@ -3374,16 +3381,31 @@ def get_reconciliation_summary(target_date: Optional[str] = Query(None), db: Ses
     d = parse_date_br(target_date) if target_date else date.today()
     if not d:
         d = date.today()
+    # PERF FIX: was 8 separate COUNT queries (one per status/severity value).
+    # A GROUP BY does the same job in 2 queries regardless of how many
+    # match_status/severity values exist.
     total = db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date == d).count()
-    matched = db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date == d, AttendanceReconciliation.match_status == "Matched").count()
-    mismatched = db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date == d, AttendanceReconciliation.match_status == "Mismatch").count()
-    missing_essl = db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date == d, AttendanceReconciliation.match_status == "Missing ESSL").count()
-    missing_tata = db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date == d, AttendanceReconciliation.match_status == "Missing Tata").count()
-    no_data = db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date == d, AttendanceReconciliation.match_status == "No Data").count()
-    week_off = db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date == d, AttendanceReconciliation.match_status == "Week Off").count()
-    critical = db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date == d, AttendanceReconciliation.severity == "Critical").count()
-    return {"total": total, "matched": matched, "mismatched": mismatched, "missing_essl": missing_essl,
-            "missing_tata": missing_tata, "no_data": no_data, "week_off": week_off, "critical": critical}
+    status_counts = dict(
+        db.query(AttendanceReconciliation.match_status, func.count(AttendanceReconciliation.id))
+        .filter(AttendanceReconciliation.date == d)
+        .group_by(AttendanceReconciliation.match_status)
+        .all()
+    )
+    critical = (
+        db.query(func.count(AttendanceReconciliation.id))
+        .filter(AttendanceReconciliation.date == d, AttendanceReconciliation.severity == "Critical")
+        .scalar() or 0
+    )
+    return {
+        "total": total,
+        "matched": status_counts.get("Matched", 0),
+        "mismatched": status_counts.get("Mismatch", 0),
+        "missing_essl": status_counts.get("Missing ESSL", 0),
+        "missing_tata": status_counts.get("Missing Tata", 0),
+        "no_data": status_counts.get("No Data", 0),
+        "week_off": status_counts.get("Week Off", 0),
+        "critical": critical
+    }
 
 @app.get("/api/v1/reconciliation/records")
 def get_reconciliation_records(target_date: Optional[str] = Query(None), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
@@ -3712,10 +3734,22 @@ def calculate_ot_threshold_alerts(
     db: Session = Depends(get_db)
 ):
     """Batch-calculate OT threshold alerts for a given month.
-    Scans all OT records and creates HRAction alerts where weekly > 12h or monthly > 48h."""
+    Scans all OT records and creates HRAction alerts where weekly > 12h or monthly > 48h.
+
+    PERF FIX: previously fired ~5 queries per unique (employee, date) pair with
+    OT that month (1 employee lookup + 2 rolling-sum queries + up to 2 existing-
+    alert checks via get_ot_totals/check_ot_thresholds) - for a few hundred
+    employees x ~20+ OT days that was tens of thousands of sequential queries
+    and could make "Recalculate" hang for minutes or time out. This now runs a
+    fixed, small number of bulk queries regardless of month size, and does the
+    rolling weekly/monthly sums in memory. Behavior (thresholds, dedup rules,
+    alert descriptions) is unchanged from the original per-key logic.
+    """
     year, mon = parse_year_month(month)
     start = date(year, mon, 1)
     end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+    # Rolling 7-day weekly window can reach up to 6 days before month start.
+    lookback_start = start - timedelta(days=6)
 
     ot_records = db.query(Overtime).filter(
         Overtime.date >= start,
@@ -3723,8 +3757,49 @@ def calculate_ot_threshold_alerts(
         Overtime.ot_hours > 0
     ).order_by(Overtime.pr_number, Overtime.date).all()
 
+    if not ot_records:
+        return {"status": "completed", "month": month, "alerts_created": 0, "details": []}
+
+    pr_numbers = sorted({r.pr_number for r in ot_records})
+
+    # One bulk fetch (instead of one query per key) of every OT row needed for
+    # rolling-week math, including the 6-day lookback before the month starts.
+    all_ot_rows = db.query(Overtime.pr_number, Overtime.date, Overtime.ot_hours).filter(
+        Overtime.pr_number.in_(pr_numbers),
+        Overtime.date >= lookback_start,
+        Overtime.date < end,
+        Overtime.ot_hours > 0
+    ).all()
+    ot_by_pr = defaultdict(list)  # pr_number -> [(date, hours), ...]
+    for pr, d, hrs in all_ot_rows:
+        ot_by_pr[pr].append((d, hrs or 0.0))
+
+    # One bulk fetch of employee names instead of one lookup per key.
+    employees = {
+        e.pr_number: e.name
+        for e in db.query(Employee.pr_number, Employee.name).filter(Employee.pr_number.in_(pr_numbers)).all()
+    }
+
+    # One bulk fetch of already-created alerts instead of an existence check per key.
+    existing_weekly = db.query(HRAction.pr_number, HRAction.date).filter(
+        HRAction.action_type == "OT Weekly Threshold",
+        HRAction.date >= lookback_start, HRAction.date < end,
+        HRAction.pr_number.in_(pr_numbers)
+    ).all()
+    existing_monthly_prs = {
+        pr for pr, in db.query(HRAction.pr_number).filter(
+            HRAction.action_type == "OT Monthly Threshold",
+            HRAction.date >= start, HRAction.date < end,
+            HRAction.pr_number.in_(pr_numbers)
+        ).all()
+    }
+    weekly_alert_dates = defaultdict(list)
+    for pr, d in existing_weekly:
+        weekly_alert_dates[pr].append(d)
+
     alerts_created = []
     checked_keys = set()
+    new_weekly_flags = defaultdict(list)  # dedup against alerts created earlier in this same run
 
     for ot in ot_records:
         key = (ot.pr_number, ot.date)
@@ -3732,16 +3807,50 @@ def calculate_ot_threshold_alerts(
             continue
         checked_keys.add(key)
 
-        emp = db.query(Employee).filter(Employee.pr_number == ot.pr_number).first()
-        if emp:
-            alerts = check_ot_thresholds(ot.pr_number, emp.name, ot.date, db)
-            if alerts:
-                alerts_created.append({
-                    "pr_number": ot.pr_number,
-                    "name": emp.name,
-                    "date": ot.date.isoformat(),
-                    "alerts": alerts
-                })
+        pr = ot.pr_number
+        ref_date = ot.date
+        emp_name = employees.get(pr, pr)
+        week_start = ref_date - timedelta(days=6)
+        month_start = date(ref_date.year, ref_date.month, 1)
+
+        weekly_ot = round(sum(h for d, h in ot_by_pr.get(pr, []) if week_start <= d <= ref_date), 2)
+        monthly_ot = round(sum(h for d, h in ot_by_pr.get(pr, []) if month_start <= d < end), 2)
+
+        record_alerts = []
+
+        if weekly_ot > OT_WEEKLY_THRESHOLD:
+            already_flagged = any(
+                week_start <= d <= ref_date
+                for d in weekly_alert_dates.get(pr, []) + new_weekly_flags.get(pr, [])
+            )
+            if not already_flagged:
+                db.add(HRAction(
+                    pr_number=pr, emp_name=emp_name, date=ref_date,
+                    action_type="OT Weekly Threshold",
+                    description=(
+                        f"{emp_name} ({pr}) has exceeded the weekly OT limit: "
+                        f"{weekly_ot}h / {OT_WEEKLY_THRESHOLD}h (week ending {ref_date.isoformat()})"
+                    ),
+                    priority="High", assigned_to="HR Manager"
+                ))
+                new_weekly_flags[pr].append(ref_date)
+                record_alerts.append({"type": "weekly", "hours": weekly_ot, "threshold": OT_WEEKLY_THRESHOLD})
+
+        if monthly_ot > OT_MONTHLY_THRESHOLD and pr not in existing_monthly_prs:
+            db.add(HRAction(
+                pr_number=pr, emp_name=emp_name, date=ref_date,
+                action_type="OT Monthly Threshold",
+                description=(
+                    f"{emp_name} ({pr}) has exceeded the monthly OT limit: "
+                    f"{monthly_ot}h / {OT_MONTHLY_THRESHOLD}h for {ref_date.strftime('%Y-%m')}"
+                ),
+                priority="Critical", assigned_to="HR Manager"
+            ))
+            existing_monthly_prs.add(pr)
+            record_alerts.append({"type": "monthly", "hours": monthly_ot, "threshold": OT_MONTHLY_THRESHOLD})
+
+        if record_alerts:
+            alerts_created.append({"pr_number": pr, "name": emp_name, "date": ref_date.isoformat(), "alerts": record_alerts})
 
     db.commit()
     return {
@@ -4855,4 +4964,4 @@ def get_ot_trend_forecast(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
