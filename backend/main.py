@@ -3035,6 +3035,7 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
 
     # Process entirely in memory
     attendance_to_insert = []
+    attendance_updates = []  # dicts for bulk_update_mappings - see note below
     recon_to_insert = []
     actions_to_insert = []
     ot_to_insert = []
@@ -3072,26 +3073,20 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
                 att_key = (emp.pr_number, d_iso)
                 if att_key in att_map:
                     existing = att_map[att_key]
-                    existing.essl_in = None
-                    existing.essl_out = None
-                    existing.tata_in = None
-                    existing.tata_out = None
-                    existing.final_in = None
-                    existing.final_out = None
-                    existing.worked_hours = 0
-                    existing.man_hrs = 0
-                    existing.ot_hours = 0
-                    existing.ot_headcount = 0
-                    existing.attendance_status = display_status
-                    existing.late_minutes = 0
-                    existing.early_minutes = 0
-                    existing.single_punch = "No"
-                    existing.is_match = "No"
-                    existing.match_status = match_status
-                    existing.shift = shift
-                    existing.category = category
-                    existing.issue = issue
-                    existing.remark = remark
+                    # NOTE: appending a plain dict for bulk_update_mappings() instead of
+                    # mutating the ORM object directly. With ~30k rows/month, mutating
+                    # tracked ORM objects makes SQLAlchemy issue one UPDATE per row at
+                    # commit time (this was the actual cause of the 300s timeout) -
+                    # bulk_update_mappings does it as a single fast batched statement.
+                    attendance_updates.append({
+                        "id": existing.id,
+                        "essl_in": None, "essl_out": None, "tata_in": None, "tata_out": None,
+                        "final_in": None, "final_out": None, "worked_hours": 0, "man_hrs": 0,
+                        "ot_hours": 0, "ot_headcount": 0, "attendance_status": display_status,
+                        "late_minutes": 0, "early_minutes": 0, "single_punch": "No",
+                        "is_match": "No", "match_status": match_status,
+                        "shift": shift, "category": category, "issue": issue, "remark": remark,
+                    })
                 else:
                     attendance_to_insert.append(Attendance(
                         employee_id=emp.id, pr_number=emp.pr_number, emp_code=emp.emp_code, date=d,
@@ -3285,33 +3280,27 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
             att_key = (emp.pr_number, d_iso)
             if att_key in att_map:
                 existing = att_map[att_key]
-                                # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
+                # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
                 essl_has_real_punches = bool(essl_in) or bool(essl_out)
                 tata_has_real_punches = bool(tata_in) or bool(tata_out)
                 if not essl_has_real_punches and tata_has_real_punches:
-                    existing.essl_in = tata_in
-                    existing.essl_out = tata_out
+                    essl_in_upd, essl_out_upd = tata_in, tata_out
                 else:
-                    existing.essl_in = essl_in
-                    existing.essl_out = essl_out
-                existing.tata_in = tata_in
-                existing.tata_out = tata_out
-                existing.final_in = final_in
-                existing.final_out = final_out
-                existing.worked_hours = worked_hours
-                existing.man_hrs = tata_man_hrs
-                existing.ot_hours = ot_hours
-                existing.ot_headcount = ot_headcount
-                existing.attendance_status = display_status
-                existing.late_minutes = late_minutes
-                existing.early_minutes = early_minutes
-                existing.single_punch = single_punch
-                existing.is_match = "Yes" if match_status == "Matched" else "No"
-                existing.match_status = match_status
-                existing.issue = issue
-                existing.shift = shift
-                existing.category = category
-                existing.remark = remark
+                    essl_in_upd, essl_out_upd = essl_in, essl_out
+                attendance_updates.append({
+                    "id": existing.id,
+                    "essl_in": essl_in_upd, "essl_out": essl_out_upd,
+                    "tata_in": tata_in, "tata_out": tata_out,
+                    "final_in": final_in, "final_out": final_out,
+                    "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
+                    "ot_hours": ot_hours, "ot_headcount": ot_headcount,
+                    "attendance_status": display_status,
+                    "late_minutes": late_minutes, "early_minutes": early_minutes,
+                    "single_punch": single_punch,
+                    "is_match": "Yes" if match_status == "Matched" else "No",
+                    "match_status": match_status, "issue": issue,
+                    "shift": shift, "category": category, "remark": remark,
+                })
             else:
             # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
                 essl_has_real_punches = bool(essl_in) or bool(essl_out)
@@ -3373,8 +3362,16 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
         d += timedelta(days=1)
 
     # FIX v3.2: Bulk insert everything at once
+    # FIX v3.2.11: this was the actual cause of the 300s timeout. On a re-run (most
+    # days already have an Attendance row from a prior reconciliation), the old code
+    # mutated ~30,000 already-persistent ORM objects directly, which makes SQLAlchemy
+    # issue one individual UPDATE per row at commit() - very slow, especially on
+    # Railway's disk. bulk_update_mappings() below does it as a handful of fast
+    # batched statements instead.
     if attendance_to_insert:
         db.bulk_save_objects(attendance_to_insert)
+    if attendance_updates:
+        db.bulk_update_mappings(Attendance, attendance_updates)
     if recon_to_insert:
         db.bulk_save_objects(recon_to_insert)
     if actions_to_insert:

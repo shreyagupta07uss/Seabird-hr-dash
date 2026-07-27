@@ -658,7 +658,8 @@ export const api = {
         formData.append('month', month);
         return fetchJSON(`${API_BASE}/reconciliation/run-month`, {
             method: 'POST',
-            body: formData
+            body: formData,
+            timeout: 600000, // was hitting the 300s default on a full month's data
         });
     },
 
