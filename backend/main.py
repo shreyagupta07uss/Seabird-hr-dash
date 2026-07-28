@@ -59,6 +59,8 @@ import os
 import re
 import hashlib
 import secrets
+import uuid
+import threading
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc
@@ -3023,12 +3025,34 @@ def run_reconciliation(target_date: str = Form(...), db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail="Invalid date format")
     return _reconcile_single_date(d, db)
 
+# ============================================================================
+# BACKGROUND JOB TRACKING for month-long reconciliation.
+#
+# Railway's public-network edge proxy enforces a hard ~5 minute cap on any single
+# HTTP request that neither side can raise - a full month's reconciliation can
+# legitimately take longer than that. So run-month no longer does the work inline:
+# it kicks off a background thread and returns a job_id immediately; the frontend
+# polls /reconciliation/run-month/{job_id} for status/progress until it's done.
+#
+# In-memory dict is fine here since this runs as a single uvicorn process/worker
+# (see the bottom of this file - no `workers=` argument). If that ever changes to
+# multiple workers, this needs to move to a DB-backed jobs table instead, since
+# each worker would have its own copy of this dict.
+# ============================================================================
+RECONCILIATION_JOBS: Dict[str, Dict[str, Any]] = {}
+
+def _set_job_stage(job_id: Optional[str], stage: str):
+    if job_id and job_id in RECONCILIATION_JOBS:
+        RECONCILIATION_JOBS[job_id]["stage"] = stage
+
 # FIX v3.2: Completely rewritten with bulk pre-fetch to eliminate timeout
-@app.post("/api/v1/reconciliation/run-month")
-def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_db)):
+def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str] = None) -> Dict[str, Any]:
     year, mon = parse_year_month(month)
     start = date(year, mon, 1)
     end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+    total_days_in_month = (end - start).days
+
+    _set_job_stage(job_id, "prefetching employee & attendance data")
 
     employees = db.query(Employee).all()
     emp_ids = [e.id for e in employees]
@@ -3428,7 +3452,10 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
                     totals["hr_actions_created"] += 1
 
         days_processed += 1
+        _set_job_stage(job_id, f"processed {days_processed}/{total_days_in_month} day(s) in memory")
         d += timedelta(days=1)
+
+    _set_job_stage(job_id, "writing results to database")
 
     # FIX v3.2: Bulk insert everything at once
     # FIX v3.2.11: this was the actual cause of the 300s timeout. On a re-run (most
@@ -3449,6 +3476,8 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
         db.bulk_save_objects(ot_to_insert)
 
     db.commit()
+
+    _set_job_stage(job_id, "checking OT thresholds")
 
     # Post-process: Check OT thresholds for employees who accrued OT this month.
     # FIX: this used to call check_ot_thresholds() - 2 SUM queries + up to 2 existence
@@ -3528,6 +3557,52 @@ def run_reconciliation_month(month: str = Form(...), db: Session = Depends(get_d
         "days_processed": days_processed,
         **totals
     }
+
+def _run_reconciliation_job(job_id: str, month: str):
+    """Runs on a background thread with its own DB session (the request-scoped
+    session from Depends(get_db) is closed by the time this executes, since the
+    triggering request has already returned)."""
+    job_db = SessionLocal()
+    try:
+        result = _run_reconciliation_month_core(month, job_db, job_id=job_id)
+        RECONCILIATION_JOBS[job_id]["status"] = "completed"
+        RECONCILIATION_JOBS[job_id]["result"] = result
+        RECONCILIATION_JOBS[job_id]["stage"] = "done"
+        RECONCILIATION_JOBS[job_id]["finished_at"] = datetime.now()
+    except Exception as e:
+        job_db.rollback()
+        RECONCILIATION_JOBS[job_id]["status"] = "failed"
+        RECONCILIATION_JOBS[job_id]["error"] = str(e)
+        RECONCILIATION_JOBS[job_id]["finished_at"] = datetime.now()
+    finally:
+        job_db.close()
+
+@app.post("/api/v1/reconciliation/run-month")
+def run_reconciliation_month(month: str = Form(...)):
+    """Kicks off month reconciliation as a background job and returns immediately.
+    Poll GET /api/v1/reconciliation/run-month/{job_id} for progress/result - see the
+    comment above RECONCILIATION_JOBS for why this isn't a single synchronous request."""
+    # Prune old finished jobs so this dict doesn't grow forever over the life of the process.
+    cutoff = datetime.now() - timedelta(hours=2)
+    for jid in [j for j, v in RECONCILIATION_JOBS.items()
+                if v["status"] != "running" and v.get("finished_at", datetime.now()) < cutoff]:
+        del RECONCILIATION_JOBS[jid]
+
+    job_id = str(uuid.uuid4())
+    RECONCILIATION_JOBS[job_id] = {
+        "status": "running", "stage": "queued", "month": month,
+        "result": None, "error": None, "started_at": datetime.now(), "finished_at": None
+    }
+    thread = threading.Thread(target=_run_reconciliation_job, args=(job_id, month), daemon=True)
+    thread.start()
+    return {"status": "started", "job_id": job_id, "month": month}
+
+@app.get("/api/v1/reconciliation/run-month/{job_id}")
+def get_reconciliation_month_job(job_id: str):
+    job = RECONCILIATION_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found (it may have completed a while ago and been cleared, or the server restarted)")
+    return job
 
 @app.get("/api/v1/reconciliation/summary")
 def get_reconciliation_summary(target_date: Optional[str] = Query(None), db: Session = Depends(get_db)):
@@ -3732,6 +3807,9 @@ def get_employee_summary(pr_number: str, month: Optional[str] = Query(None), db:
     # Late punch penalty + half days count as 0.5 each
     total_penalty_days = late_penalty_data["penalty_days"] + (counts["half_day"] * 0.5)
 
+    # Total OT hours for the month
+    total_ot_hours = round(sum(r.ot_hours or 0 for r in records), 2)
+
     # Total working days in month
     total_days = counts["present"] + counts["absent"] + counts["half_day"] + counts["leave"] + counts["weekoff"] + counts["single_punch"]
 
@@ -3766,7 +3844,8 @@ def get_employee_summary(pr_number: str, month: Optional[str] = Query(None), db:
             "less_working_hours": counts["less_working_hours"],
             "no_data": counts["no_data"],
             "attendance_percentage": attendance_percentage,
-            "effective_present_days": effective_present
+            "effective_present_days": effective_present,
+            "total_ot_hours": total_ot_hours
         },
         "penalty": {
             "late_punch_penalty_days": late_penalty_data["penalty_days"],

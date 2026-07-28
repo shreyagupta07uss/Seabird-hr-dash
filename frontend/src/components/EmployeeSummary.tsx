@@ -213,6 +213,12 @@ export default function EmployeeSummary({ initialPR }: EmployeeSummaryProps) {
                             <p className="text-[10px] text-emerald-600 font-medium uppercase tracking-wide">Attendance %</p>
                             <p className="text-lg font-bold text-emerald-700">{data.summary.attendance_percentage}%</p>
                         </div>
+                        <div className="p-3 rounded-xl bg-indigo-50 border border-indigo-100">
+                            <p className="text-[10px] text-indigo-600 font-medium uppercase tracking-wide flex items-center gap-1">
+                                <Clock size={10} /> OT This Month
+                            </p>
+                            <p className="text-lg font-bold text-indigo-700">{formatHours(data.summary.total_ot_hours)}</p>
+                        </div>
                     </div>
 
                     {/* Penalty Card */}

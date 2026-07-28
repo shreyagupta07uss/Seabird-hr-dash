@@ -387,6 +387,7 @@ export interface EmployeeSummary {
         no_data: number;
         attendance_percentage: number;
         effective_present_days: number;
+        total_ot_hours: number;
     };
     penalty: {
         late_punch_penalty_days: number;
