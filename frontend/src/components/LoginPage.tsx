@@ -33,7 +33,7 @@ export default function LoginPage() {
         <div style={styles.header}>
           <div style={styles.logo}>🛡️</div>
           <h1 style={styles.title}>SeaBird HR</h1>
-          <p style={styles.subtitle}>Gurugram Police — ScamShield</p>
+          <p className="text-slate-500 mt-2">Workforce Analytics Platform</p>
         </div>
 
         <form onSubmit={handleSubmit} style={styles.form}>
