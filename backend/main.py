@@ -3086,7 +3086,7 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
     end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
     total_days_in_month = (end - start).days
 
-    _set_job_stage(job_id, "prefetching employee & attendance data")
+    _set_job_stage(job_id, "prefetching employee data")
 
     employees = db.query(Employee).all()
     emp_ids = [e.id for e in employees]
@@ -3094,426 +3094,471 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
     emp_by_pr = {e.pr_number: e for e in employees if e.pr_number}
     pr_numbers = [e.pr_number for e in employees]
 
-    # FIX v3.2: Pre-fetch ALL data for the ENTIRE month in 5 bulk queries
-    all_essl = db.query(ESSLAttendance).filter(
-        ESSLAttendance.pr_number.in_(pr_numbers),
-        ESSLAttendance.date >= start,
-        ESSLAttendance.date < end
-    ).all()
-    essl_map = {}
-    for e in all_essl:
-        key = (e.pr_number, e.date.isoformat())
-        essl_map[key] = e
+    # MEMORY FIX: the previous version pre-fetched every ESSL/Tata/Attendance/
+    # Reconciliation/HRAction/Overtime row for the ENTIRE month (~20-30k rows per
+    # table) and held all six of those row sets, plus the insert/update lists
+    # being built from them, in memory simultaneously for the whole run. With a
+    # large workforce that peak footprint (a few hundred thousand mapped ORM
+    # objects at once, on top of everything else the single process was already
+    # serving) was large enough to risk exceeding the container's memory limit -
+    # which reads externally as the process/container being killed and restarted
+    # mid-request, i.e. an instant connection-reset ("502") on whatever request
+    # happened to be in flight at that moment, exactly as observed in production.
+    #
+    # The whole-month "Tata-only" employee detection below only needs to know
+    # WHICH pr_numbers have any ESSL/Tata row this month, not the row contents,
+    # so it is computed with two cheap distinct-pr_number-only queries up front.
+    # The actual per-day row data is then fetched CHUNK_DAYS days at a time in
+    # the loop below, so peak memory is bounded by one chunk's worth of rows
+    # instead of the whole month's, regardless of workforce size.
+    CHUNK_DAYS = 5
 
-    all_tata = db.query(TataAttendance).filter(
-        TataAttendance.pr_number.in_(pr_numbers),
-        TataAttendance.date >= start,
-        TataAttendance.date < end
-    ).all()
-    tata_map = {}
-    for t in all_tata:
-        key = (t.pr_number, t.date.isoformat())
-        tata_map[key] = t
-
-    # TATA-ONLY DETECTION: employees with Tata data but ZERO ESSL records for the entire month
-    essl_prs_month = set(e.pr_number for e in all_essl if e.pr_number)
-    tata_prs_month = set(t.pr_number for t in all_tata if t.pr_number)
+    essl_prs_month = {
+        pr for (pr,) in db.query(ESSLAttendance.pr_number).filter(
+            ESSLAttendance.pr_number.in_(pr_numbers),
+            ESSLAttendance.date >= start, ESSLAttendance.date < end
+        ).distinct().all() if pr
+    }
+    tata_prs_month = {
+        pr for (pr,) in db.query(TataAttendance.pr_number).filter(
+            TataAttendance.pr_number.in_(pr_numbers),
+            TataAttendance.date >= start, TataAttendance.date < end
+        ).distinct().all() if pr
+    }
     tata_only_prs = tata_prs_month - essl_prs_month
-
-    all_att = db.query(Attendance).filter(
-        Attendance.pr_number.in_(pr_numbers),
-        Attendance.date >= start,
-        Attendance.date < end
-    ).all()
-    att_map = {}
-    for a in all_att:
-        key = (a.pr_number, a.date.isoformat())
-        att_map[key] = a
-
-    all_recon = db.query(AttendanceReconciliation).filter(
-        AttendanceReconciliation.pr_number.in_(pr_numbers),
-        AttendanceReconciliation.date >= start,
-        AttendanceReconciliation.date < end
-    ).all()
-    recon_map = {}
-    for r in all_recon:
-        key = (r.pr_number, r.date.isoformat())
-        recon_map[key] = r
-
-    all_actions = db.query(HRAction).filter(
-        HRAction.pr_number.in_(pr_numbers),
-        HRAction.date >= start,
-        HRAction.date < end
-    ).all()
-    action_map = {}
-    for a in all_actions:
-        key = (a.pr_number, a.date.isoformat(), a.action_type)
-        action_map[key] = a
-
-    all_ot = db.query(Overtime).filter(
-        Overtime.pr_number.in_(pr_numbers),
-        Overtime.date >= start,
-        Overtime.date < end
-    ).all()
-    ot_map = {}
-    for o in all_ot:
-        key = (o.pr_number, o.date.isoformat())
-        ot_map[key] = o
-
-    # Process entirely in memory
-    attendance_to_insert = []
-    attendance_updates = []  # dicts for bulk_update_mappings - see note below
-    recon_to_insert = []
-    actions_to_insert = []
-    ot_to_insert = []
 
     days_processed = 0
     totals = {"attendance_records_created": 0, "reconciliation_issues": 0, "hr_actions_created": 0}
+    month_ot_by_pr: Dict[str, List[tuple]] = {}  # accumulated across chunks for the OT-threshold post-check
 
-    d = start
-    while d < end:
-        d_iso = d.isoformat()
-        for emp in employees:
-            emp_id = emp.id
-            key = (emp.pr_number, d_iso)
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end)
+        _set_job_stage(job_id, f"prefetching {chunk_start.isoformat()} to {(chunk_end - timedelta(days=1)).isoformat()}")
 
-            essl = essl_map.get(key)
-            tata = tata_map.get(key)
+        all_essl = db.query(ESSLAttendance).filter(
+            ESSLAttendance.pr_number.in_(pr_numbers),
+            ESSLAttendance.date >= chunk_start,
+            ESSLAttendance.date < chunk_end
+        ).all()
+        essl_map = {}
+        for e in all_essl:
+            key = (e.pr_number, e.date.isoformat())
+            essl_map[key] = e
 
-            essl_in = essl.in_time if essl else None
-            essl_out = essl.out_time if essl else None
-            tata_in = tata.in_time if tata else None
-            tata_out = tata.out_time if tata else None
-            tata_man_hrs = tata.man_hrs if tata else 0
-            tata_status = tata.status if tata else None
-            essl_status = _get_essl_status(essl)
+        all_tata = db.query(TataAttendance).filter(
+            TataAttendance.pr_number.in_(pr_numbers),
+            TataAttendance.date >= chunk_start,
+            TataAttendance.date < chunk_end
+        ).all()
+        tata_map = {}
+        for t in all_tata:
+            key = (t.pr_number, t.date.isoformat())
+            tata_map[key] = t
 
-            # FIX v3.2.8: If employee has NO ESSL and NO Tata data, create "Absent" record
-            if not essl and not tata:
-                shift = safe_shift(emp.shift) if emp.shift else "G"
+        all_att = db.query(Attendance).filter(
+            Attendance.pr_number.in_(pr_numbers),
+            Attendance.date >= chunk_start,
+            Attendance.date < chunk_end
+        ).all()
+        att_map = {}
+        for a in all_att:
+            key = (a.pr_number, a.date.isoformat())
+            att_map[key] = a
+
+        all_recon = db.query(AttendanceReconciliation).filter(
+            AttendanceReconciliation.pr_number.in_(pr_numbers),
+            AttendanceReconciliation.date >= chunk_start,
+            AttendanceReconciliation.date < chunk_end
+        ).all()
+        recon_map = {}
+        for r in all_recon:
+            key = (r.pr_number, r.date.isoformat())
+            recon_map[key] = r
+
+        all_actions = db.query(HRAction).filter(
+            HRAction.pr_number.in_(pr_numbers),
+            HRAction.date >= chunk_start,
+            HRAction.date < chunk_end
+        ).all()
+        action_map = {}
+        for a in all_actions:
+            key = (a.pr_number, a.date.isoformat(), a.action_type)
+            action_map[key] = a
+
+        all_ot = db.query(Overtime).filter(
+            Overtime.pr_number.in_(pr_numbers),
+            Overtime.date >= chunk_start,
+            Overtime.date < chunk_end
+        ).all()
+        ot_map = {}
+        for o in all_ot:
+            key = (o.pr_number, o.date.isoformat())
+            ot_map[key] = o
+            if o.ot_hours and o.ot_hours > 0:
+                month_ot_by_pr.setdefault(o.pr_number, []).append((o.date, o.ot_hours))
+
+        # Process this chunk entirely in memory
+        attendance_to_insert = []
+        attendance_updates = []  # dicts for bulk_update_mappings - see note below
+        recon_to_insert = []
+        actions_to_insert = []
+        ot_to_insert = []
+
+
+        d = chunk_start
+        while d < chunk_end:
+            d_iso = d.isoformat()
+            for emp in employees:
+                emp_id = emp.id
+                key = (emp.pr_number, d_iso)
+
+                essl = essl_map.get(key)
+                tata = tata_map.get(key)
+
+                essl_in = essl.in_time if essl else None
+                essl_out = essl.out_time if essl else None
+                tata_in = tata.in_time if tata else None
+                tata_out = tata.out_time if tata else None
+                tata_man_hrs = tata.man_hrs if tata else 0
+                tata_status = tata.status if tata else None
+                essl_status = _get_essl_status(essl)
+
+                # FIX v3.2.8: If employee has NO ESSL and NO Tata data, create "Absent" record
+                if not essl and not tata:
+                    shift = safe_shift(emp.shift) if emp.shift else "G"
+                    category = emp.wc or "BC"
+                    display_status = "Absent"
+                    issue = "No Data"
+                    match_status = "No Data"
+                    remark = "No ESSL or Tata record found for this date"
+
+                    att_key = (emp.pr_number, d_iso)
+                    if att_key in att_map:
+                        existing = att_map[att_key]
+                        # NOTE: appending a plain dict for bulk_update_mappings() instead of
+                        # mutating the ORM object directly. With ~30k rows/month, mutating
+                        # tracked ORM objects makes SQLAlchemy issue one UPDATE per row at
+                        # commit time (this was the actual cause of the 300s timeout) -
+                        # bulk_update_mappings does it as a single fast batched statement.
+                        attendance_updates.append({
+                            "id": existing.id,
+                            "essl_in": None, "essl_out": None, "tata_in": None, "tata_out": None,
+                            "final_in": None, "final_out": None, "worked_hours": 0, "man_hrs": 0,
+                            "ot_hours": 0, "ot_headcount": 0, "attendance_status": display_status,
+                            "late_minutes": 0, "early_minutes": 0, "single_punch": "No",
+                            "is_match": "No", "match_status": match_status,
+                            "shift": shift, "category": category, "issue": issue, "remark": remark,
+                        })
+                    else:
+                        attendance_to_insert.append({
+                            "employee_id": emp.id, "pr_number": emp.pr_number, "emp_code": emp.emp_code, "date": d,
+                            "essl_in": None, "essl_out": None, "tata_in": None, "tata_out": None,
+                            "final_in": None, "final_out": None, "worked_hours": 0, "man_hrs": 0,
+                            "ot_hours": 0, "ot_headcount": 0, "attendance_status": display_status,
+                            "late_minutes": 0, "early_minutes": 0, "single_punch": "No",
+                            "is_match": "No", "match_status": match_status,
+                            "vendor": emp.vendor, "store": emp.store, "department": emp.department,
+                            "shift": shift, "category": category, "remark": remark, "issue": issue, "source": "reconciliation"
+                        })
+                        totals["attendance_records_created"] += 1
+                    continue
+
+                # Continue with existing logic for employees who HAVE ESSL or Tata data
+
+                # FIX v3.2.7: For WO employees, shift stays empty. For absent, use master shift.
+                has_essl_punches = bool(essl_in or essl_out)
+                has_tata_punches = bool(tata_in or tata_out)
+                has_any_punches = has_essl_punches or has_tata_punches
+
+                if essl_status == "WO" and not has_any_punches:
+                    # Week Off: no shift shown, status will be "Week Off"
+                    shift = None
+                elif not has_any_punches:
+                    # Regular absent: use assigned shift from master
+                    shift = safe_shift(emp.shift) if emp.shift else "G"
+                else:
+                    shift = safe_shift((tata.shift if tata and tata.shift else None) or (essl.shift if essl and essl.shift else None) or emp.shift) or "G"
                 category = emp.wc or "BC"
-                display_status = "Absent"
-                issue = "No Data"
-                match_status = "No Data"
-                remark = "No ESSL or Tata record found for this date"
+
+                has_essl = bool(essl_in or essl_out or essl_status)
+                has_tata = bool(tata_in or tata_out)
+                # FIX v3.2.5: Check actual punches separately from status
+                has_essl_punches = bool(essl_in or essl_out)
+                has_tata_punches = bool(tata_in or tata_out)
+                has_any_punches = has_essl_punches or has_tata_punches
+
+                match_delta_in = 0
+                match_delta_out = 0
+
+                # FIX v3.2.5: WO = Absent only if NO actual punches from either source
+                if essl_status == "WO" and not has_any_punches:
+                    match_status = "Absent"
+                    reconciliation_severity = "Low"
+                    remark = "ESSL shows WO (treated as Absent - no punches)"
+                elif essl_status == "WO" and has_any_punches:
+                    # ESSL says WO but punches exist → Present, flag mismatch
+                    match_status = "Mismatch"
+                    reconciliation_severity = "Medium"
+                    remark = "ESSL shows WO but punches exist"
+                elif not has_essl and not has_tata:
+                    match_status = "No Data"
+                    reconciliation_severity = "Critical"
+                    remark = ""
+                elif emp.pr_number in tata_only_prs:
+                    # TATA-ONLY: Employee has no ESSL data but has Tata data → use Tata only, not an error
+                    match_status = "Tata Only"
+                    reconciliation_severity = "Low"
+                    remark = "Tata-only employee (no ESSL data)"
+                elif not has_essl and has_tata:
+                    match_status = "Missing ESSL"
+                    reconciliation_severity = "High"
+                    remark = "No Punch ESSL"
+                elif has_essl and not has_tata:
+                    match_status = "Missing Tata"
+                    reconciliation_severity = "High"
+                    remark = ""
+                else:
+                    if essl_in and tata_in:
+                        match_delta_in = abs(time_to_minutes(essl_in) - time_to_minutes(tata_in))
+                    if essl_out and tata_out:
+                        match_delta_out = abs(time_to_minutes(essl_out) - time_to_minutes(tata_out))
+                    if match_delta_in > 15 or match_delta_out > 15:
+                        match_status = "Mismatch"
+                        reconciliation_severity = "Medium"
+                    else:
+                        match_status = "Matched"
+                        reconciliation_severity = "Low"
+                    remark = ""
+
+                if match_status != "Matched":
+                    recon_key = (emp.pr_number, d_iso)
+                    if recon_key not in recon_map:
+                        recon_to_insert.append({
+                            "pr_number": emp.pr_number, "emp_name": emp.name, "date": d,
+                            "essl_in": essl_in, "essl_out": essl_out, "tata_in": tata_in, "tata_out": tata_out,
+                            "in_delta_minutes": match_delta_in, "out_delta_minutes": match_delta_out,
+                            "match_status": match_status, "severity": reconciliation_severity,
+                            "remarks": f"ESSL: {essl_in}-{essl_out}, Tata: {tata_in}-{tata_out}"
+                        })
+                        totals["reconciliation_issues"] += 1
+
+                final_in = tata_in or essl_in
+                final_out = tata_out or essl_out
+                punch_count = sum([1 for p in [final_in, final_out] if p])
+                single_punch = "Yes" if punch_count == 1 else "No"
+
+                # TATA PRIORITY: Determine which source to use for OT/worked_hours calculation
+                tata_has_punches = bool(tata_in or tata_out)
+                tata_has_man_hrs = bool(tata_man_hrs and tata_man_hrs > 0)
+                essl_has_punches = bool(essl_in or essl_out)
+
+                # Priority: Tata punches > Tata man_hrs > ESSL punches > 0
+                if tata_has_punches:
+                    # Tata has punches → calculate OT from Tata punches
+                    ot_in_time, ot_out_time = tata_in, tata_out
+                    force_man_hrs = False
+                elif tata_has_man_hrs:
+                    # Tata has no punches but has man_hrs → use man_hrs for worked_hours
+                    ot_in_time, ot_out_time = None, None
+                    force_man_hrs = True
+                elif essl_has_punches:
+                    # No Tata data → use ESSL punches
+                    ot_in_time, ot_out_time = essl_in, essl_out
+                    force_man_hrs = False
+                else:
+                    ot_in_time, ot_out_time = None, None
+                    force_man_hrs = False
+
+                summary = calculate_daily_summary(shift, category, tata_status, ot_in_time, ot_out_time, tata_man_hrs, force_man_hrs=force_man_hrs)
+                worked_hours = summary["worked_hours"]
+                attendance_status = summary["status"]
+                late_minutes = summary["late_minutes"]
+                ot_hours = summary["calculated_ot_hours"]
+                ot_headcount = summary["ot_headcount"]
+
+                status_map = {"P": "Present", "A": "Absent", "SP": "Single Punch", "L": "Leave", "HD": "Half Day", "WO": "Week Off"}
+                display_status = status_map.get(attendance_status, attendance_status)
+
+                # FIX v3.2.7: Override to "Week Off" if ESSL says WO and no punches
+                if essl_status == "WO" and not has_any_punches:
+                    display_status = "Week Off"
+
+                # FIX v3.2.4: Status stays "Present" for Late Punch, Early Departure, etc.
+                # The Issue column captures the specific problem. Only Present/Absent as main status.
+                if summary["is_late_punch"] and display_status == "Present":
+                    pass  # Status stays "Present", issue = "Late Punch"
+                elif summary["is_early_departure"] and display_status == "Present":
+                    pass  # Status stays "Present", issue = "Early Departure"
+                elif summary["is_less_working_hours"] and display_status == "Present":
+                    pass  # Status stays "Present", issue = "Less Working Hours"
+                # FIX v3.2.1: Removed "Missing ESSL" override. Tata punches = Present.
+                # match_status already reports "Missing ESSL" for data quality.
+
+                # Compute Issue field for HR actionability
+                issue = "-"
+                if display_status == "Week Off":
+                    issue = "Week Off"
+                elif display_status == "Absent":
+                    issue = "Absent"
+                elif essl_status == "WO" and has_tata:
+                    issue = "ESSL WO vs Tata Punches"
+                elif emp.pr_number in tata_only_prs:
+                    issue = "-"
+                elif not has_essl and has_tata:
+                    issue = "Missing ESSL Punch"
+                elif has_essl and not has_tata:
+                    issue = "Missing Tata Punch"
+                elif match_status == "Mismatch":
+                    if abs(match_delta_in) > 30 or abs(match_delta_out) > 30:
+                        issue = "Time Difference (>30 min)"
+                    else:
+                        issue = "Time Difference"
+                # FIX v3.2.4: Check summary flags instead of display_status for sub-issues
+                elif summary["is_single_punch"]:
+                    issue = "Single Punch"
+                elif summary["is_late_punch"]:
+                    issue = "Late Punch"
+                elif summary["is_early_departure"]:
+                    issue = "Early Departure"
+                elif summary["is_less_working_hours"]:
+                    issue = "Less Working Hours"
+
+                # Check alternate shift
+                # FIX v3.2.2: Only flag if both daily and master shifts are valid shift codes
+                if emp.shift and shift:
+                    daily_shift = normalize_shift(shift)
+                    master_shift = normalize_shift(emp.shift)
+                    if daily_shift in VALID_SHIFT_CODES and master_shift in VALID_SHIFT_CODES and daily_shift != master_shift and display_status in ["Present", "Single Punch"]:
+                        issue = "Alternate Shift"
+
+                early_minutes = 0
+                if final_out and summary["is_early_departure"]:
+                    shift_end = get_shift_end_time(shift)
+                    out_mins = time_to_minutes(final_out)
+                    expected_mins = shift_end.hour * 60 + shift_end.minute
+                    if out_mins < expected_mins:
+                        early_minutes = expected_mins - out_mins
 
                 att_key = (emp.pr_number, d_iso)
                 if att_key in att_map:
                     existing = att_map[att_key]
-                    # NOTE: appending a plain dict for bulk_update_mappings() instead of
-                    # mutating the ORM object directly. With ~30k rows/month, mutating
-                    # tracked ORM objects makes SQLAlchemy issue one UPDATE per row at
-                    # commit time (this was the actual cause of the 300s timeout) -
-                    # bulk_update_mappings does it as a single fast batched statement.
+                    # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
+                    essl_has_real_punches = bool(essl_in) or bool(essl_out)
+                    tata_has_real_punches = bool(tata_in) or bool(tata_out)
+                    if not essl_has_real_punches and tata_has_real_punches:
+                        essl_in_upd, essl_out_upd = tata_in, tata_out
+                    else:
+                        essl_in_upd, essl_out_upd = essl_in, essl_out
                     attendance_updates.append({
                         "id": existing.id,
-                        "essl_in": None, "essl_out": None, "tata_in": None, "tata_out": None,
-                        "final_in": None, "final_out": None, "worked_hours": 0, "man_hrs": 0,
-                        "ot_hours": 0, "ot_headcount": 0, "attendance_status": display_status,
-                        "late_minutes": 0, "early_minutes": 0, "single_punch": "No",
-                        "is_match": "No", "match_status": match_status,
-                        "shift": shift, "category": category, "issue": issue, "remark": remark,
+                        "essl_in": essl_in_upd, "essl_out": essl_out_upd,
+                        "tata_in": tata_in, "tata_out": tata_out,
+                        "final_in": final_in, "final_out": final_out,
+                        "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
+                        "ot_hours": ot_hours, "ot_headcount": ot_headcount,
+                        "attendance_status": display_status,
+                        "late_minutes": late_minutes, "early_minutes": early_minutes,
+                        "single_punch": single_punch,
+                        "is_match": "Yes" if match_status == "Matched" else "No",
+                        "match_status": match_status, "issue": issue,
+                        "shift": shift, "category": category, "remark": remark,
                     })
                 else:
+                # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
+                    essl_has_real_punches = bool(essl_in) or bool(essl_out)
+                    tata_has_real_punches = bool(tata_in) or bool(tata_out)
+                    if not essl_has_real_punches and tata_has_real_punches:
+                        essl_in_val = tata_in
+                        essl_out_val = tata_out
+                    else:
+                        essl_in_val = essl_in
+                        essl_out_val = essl_out
                     attendance_to_insert.append({
                         "employee_id": emp.id, "pr_number": emp.pr_number, "emp_code": emp.emp_code, "date": d,
-                        "essl_in": None, "essl_out": None, "tata_in": None, "tata_out": None,
-                        "final_in": None, "final_out": None, "worked_hours": 0, "man_hrs": 0,
-                        "ot_hours": 0, "ot_headcount": 0, "attendance_status": display_status,
-                        "late_minutes": 0, "early_minutes": 0, "single_punch": "No",
-                        "is_match": "No", "match_status": match_status,
+                        "essl_in": essl_in_val, "essl_out": essl_out_val, "tata_in": tata_in, "tata_out": tata_out,
+                        "final_in": final_in, "final_out": final_out, "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
+                        "ot_hours": ot_hours, "ot_headcount": ot_headcount, "attendance_status": display_status,
+                        "late_minutes": late_minutes, "early_minutes": early_minutes, "single_punch": single_punch,
+                        "is_match": "Yes" if match_status == "Matched" else "No", "match_status": match_status,
                         "vendor": emp.vendor, "store": emp.store, "department": emp.department,
                         "shift": shift, "category": category, "remark": remark, "issue": issue, "source": "reconciliation"
                     })
                     totals["attendance_records_created"] += 1
-                continue
 
-            # Continue with existing logic for employees who HAVE ESSL or Tata data
+                action_checks = [
+                    ("Single Punch", display_status == "Single Punch", "Medium", "HR Manager",
+                     f"{emp.name} ({emp.pr_number}) has single punch on {d_iso}"),
+                    ("Late Punch", late_minutes > 0, "Low", "Supervisor",
+                     f"{emp.name} ({emp.pr_number}) punched {late_minutes} minutes late on {d_iso}"),
+                    ("Early Departure", early_minutes > 0, "Low", "Supervisor",
+                     f"{emp.name} ({emp.pr_number}) left {early_minutes} minutes early on {d_iso}"),
+                    ("Less Working Hours", display_status == "Less Working Hours", "Medium", "HR Manager",
+                     f"{emp.name} ({emp.pr_number}) worked {worked_hours}hrs instead of {get_standard_hours(shift)}hrs on {d_iso}"),
+                    ("Reconciliation", match_status != "Matched",
+                     "High" if reconciliation_severity in ["Critical", "High"] else "Medium", "HR Manager",
+                     f"{emp.name} ({emp.pr_number}) has {match_status} on {d_iso}. ESSL: {essl_in}-{essl_out}, Tata: {tata_in}-{tata_out}")
+                ]
 
-            # FIX v3.2.7: For WO employees, shift stays empty. For absent, use master shift.
-            has_essl_punches = bool(essl_in or essl_out)
-            has_tata_punches = bool(tata_in or tata_out)
-            has_any_punches = has_essl_punches or has_tata_punches
+                for action_type, condition, priority, assigned_to, description in action_checks:
+                    if condition:
+                        action_key = (emp.pr_number, d_iso, action_type)
+                        if action_key not in action_map:
+                            actions_to_insert.append({
+                                "pr_number": emp.pr_number, "emp_name": emp.name, "date": d,
+                                "action_type": action_type, "description": description,
+                                "priority": priority, "assigned_to": assigned_to
+                            })
+                            totals["hr_actions_created"] += 1
 
-            if essl_status == "WO" and not has_any_punches:
-                # Week Off: no shift shown, status will be "Week Off"
-                shift = None
-            elif not has_any_punches:
-                # Regular absent: use assigned shift from master
-                shift = safe_shift(emp.shift) if emp.shift else "G"
-            else:
-                shift = safe_shift((tata.shift if tata and tata.shift else None) or (essl.shift if essl and essl.shift else None) or emp.shift) or "G"
-            category = emp.wc or "BC"
-
-            has_essl = bool(essl_in or essl_out or essl_status)
-            has_tata = bool(tata_in or tata_out)
-            # FIX v3.2.5: Check actual punches separately from status
-            has_essl_punches = bool(essl_in or essl_out)
-            has_tata_punches = bool(tata_in or tata_out)
-            has_any_punches = has_essl_punches or has_tata_punches
-
-            match_delta_in = 0
-            match_delta_out = 0
-
-            # FIX v3.2.5: WO = Absent only if NO actual punches from either source
-            if essl_status == "WO" and not has_any_punches:
-                match_status = "Absent"
-                reconciliation_severity = "Low"
-                remark = "ESSL shows WO (treated as Absent - no punches)"
-            elif essl_status == "WO" and has_any_punches:
-                # ESSL says WO but punches exist → Present, flag mismatch
-                match_status = "Mismatch"
-                reconciliation_severity = "Medium"
-                remark = "ESSL shows WO but punches exist"
-            elif not has_essl and not has_tata:
-                match_status = "No Data"
-                reconciliation_severity = "Critical"
-                remark = ""
-            elif emp.pr_number in tata_only_prs:
-                # TATA-ONLY: Employee has no ESSL data but has Tata data → use Tata only, not an error
-                match_status = "Tata Only"
-                reconciliation_severity = "Low"
-                remark = "Tata-only employee (no ESSL data)"
-            elif not has_essl and has_tata:
-                match_status = "Missing ESSL"
-                reconciliation_severity = "High"
-                remark = "No Punch ESSL"
-            elif has_essl and not has_tata:
-                match_status = "Missing Tata"
-                reconciliation_severity = "High"
-                remark = ""
-            else:
-                if essl_in and tata_in:
-                    match_delta_in = abs(time_to_minutes(essl_in) - time_to_minutes(tata_in))
-                if essl_out and tata_out:
-                    match_delta_out = abs(time_to_minutes(essl_out) - time_to_minutes(tata_out))
-                if match_delta_in > 15 or match_delta_out > 15:
-                    match_status = "Mismatch"
-                    reconciliation_severity = "Medium"
-                else:
-                    match_status = "Matched"
-                    reconciliation_severity = "Low"
-                remark = ""
-
-            if match_status != "Matched":
-                recon_key = (emp.pr_number, d_iso)
-                if recon_key not in recon_map:
-                    recon_to_insert.append({
-                        "pr_number": emp.pr_number, "emp_name": emp.name, "date": d,
-                        "essl_in": essl_in, "essl_out": essl_out, "tata_in": tata_in, "tata_out": tata_out,
-                        "in_delta_minutes": match_delta_in, "out_delta_minutes": match_delta_out,
-                        "match_status": match_status, "severity": reconciliation_severity,
-                        "remarks": f"ESSL: {essl_in}-{essl_out}, Tata: {tata_in}-{tata_out}"
-                    })
-                    totals["reconciliation_issues"] += 1
-
-            final_in = tata_in or essl_in
-            final_out = tata_out or essl_out
-            punch_count = sum([1 for p in [final_in, final_out] if p])
-            single_punch = "Yes" if punch_count == 1 else "No"
-
-            # TATA PRIORITY: Determine which source to use for OT/worked_hours calculation
-            tata_has_punches = bool(tata_in or tata_out)
-            tata_has_man_hrs = bool(tata_man_hrs and tata_man_hrs > 0)
-            essl_has_punches = bool(essl_in or essl_out)
-
-            # Priority: Tata punches > Tata man_hrs > ESSL punches > 0
-            if tata_has_punches:
-                # Tata has punches → calculate OT from Tata punches
-                ot_in_time, ot_out_time = tata_in, tata_out
-                force_man_hrs = False
-            elif tata_has_man_hrs:
-                # Tata has no punches but has man_hrs → use man_hrs for worked_hours
-                ot_in_time, ot_out_time = None, None
-                force_man_hrs = True
-            elif essl_has_punches:
-                # No Tata data → use ESSL punches
-                ot_in_time, ot_out_time = essl_in, essl_out
-                force_man_hrs = False
-            else:
-                ot_in_time, ot_out_time = None, None
-                force_man_hrs = False
-
-            summary = calculate_daily_summary(shift, category, tata_status, ot_in_time, ot_out_time, tata_man_hrs, force_man_hrs=force_man_hrs)
-            worked_hours = summary["worked_hours"]
-            attendance_status = summary["status"]
-            late_minutes = summary["late_minutes"]
-            ot_hours = summary["calculated_ot_hours"]
-            ot_headcount = summary["ot_headcount"]
-
-            status_map = {"P": "Present", "A": "Absent", "SP": "Single Punch", "L": "Leave", "HD": "Half Day", "WO": "Week Off"}
-            display_status = status_map.get(attendance_status, attendance_status)
-
-            # FIX v3.2.7: Override to "Week Off" if ESSL says WO and no punches
-            if essl_status == "WO" and not has_any_punches:
-                display_status = "Week Off"
-
-            # FIX v3.2.4: Status stays "Present" for Late Punch, Early Departure, etc.
-            # The Issue column captures the specific problem. Only Present/Absent as main status.
-            if summary["is_late_punch"] and display_status == "Present":
-                pass  # Status stays "Present", issue = "Late Punch"
-            elif summary["is_early_departure"] and display_status == "Present":
-                pass  # Status stays "Present", issue = "Early Departure"
-            elif summary["is_less_working_hours"] and display_status == "Present":
-                pass  # Status stays "Present", issue = "Less Working Hours"
-            # FIX v3.2.1: Removed "Missing ESSL" override. Tata punches = Present.
-            # match_status already reports "Missing ESSL" for data quality.
-
-            # Compute Issue field for HR actionability
-            issue = "-"
-            if display_status == "Week Off":
-                issue = "Week Off"
-            elif display_status == "Absent":
-                issue = "Absent"
-            elif essl_status == "WO" and has_tata:
-                issue = "ESSL WO vs Tata Punches"
-            elif emp.pr_number in tata_only_prs:
-                issue = "-"
-            elif not has_essl and has_tata:
-                issue = "Missing ESSL Punch"
-            elif has_essl and not has_tata:
-                issue = "Missing Tata Punch"
-            elif match_status == "Mismatch":
-                if abs(match_delta_in) > 30 or abs(match_delta_out) > 30:
-                    issue = "Time Difference (>30 min)"
-                else:
-                    issue = "Time Difference"
-            # FIX v3.2.4: Check summary flags instead of display_status for sub-issues
-            elif summary["is_single_punch"]:
-                issue = "Single Punch"
-            elif summary["is_late_punch"]:
-                issue = "Late Punch"
-            elif summary["is_early_departure"]:
-                issue = "Early Departure"
-            elif summary["is_less_working_hours"]:
-                issue = "Less Working Hours"
-
-            # Check alternate shift
-            # FIX v3.2.2: Only flag if both daily and master shifts are valid shift codes
-            if emp.shift and shift:
-                daily_shift = normalize_shift(shift)
-                master_shift = normalize_shift(emp.shift)
-                if daily_shift in VALID_SHIFT_CODES and master_shift in VALID_SHIFT_CODES and daily_shift != master_shift and display_status in ["Present", "Single Punch"]:
-                    issue = "Alternate Shift"
-
-            early_minutes = 0
-            if final_out and summary["is_early_departure"]:
-                shift_end = get_shift_end_time(shift)
-                out_mins = time_to_minutes(final_out)
-                expected_mins = shift_end.hour * 60 + shift_end.minute
-                if out_mins < expected_mins:
-                    early_minutes = expected_mins - out_mins
-
-            att_key = (emp.pr_number, d_iso)
-            if att_key in att_map:
-                existing = att_map[att_key]
-                # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
-                essl_has_real_punches = bool(essl_in) or bool(essl_out)
-                tata_has_real_punches = bool(tata_in) or bool(tata_out)
-                if not essl_has_real_punches and tata_has_real_punches:
-                    essl_in_upd, essl_out_upd = tata_in, tata_out
-                else:
-                    essl_in_upd, essl_out_upd = essl_in, essl_out
-                attendance_updates.append({
-                    "id": existing.id,
-                    "essl_in": essl_in_upd, "essl_out": essl_out_upd,
-                    "tata_in": tata_in, "tata_out": tata_out,
-                    "final_in": final_in, "final_out": final_out,
-                    "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
-                    "ot_hours": ot_hours, "ot_headcount": ot_headcount,
-                    "attendance_status": display_status,
-                    "late_minutes": late_minutes, "early_minutes": early_minutes,
-                    "single_punch": single_punch,
-                    "is_match": "Yes" if match_status == "Matched" else "No",
-                    "match_status": match_status, "issue": issue,
-                    "shift": shift, "category": category, "remark": remark,
-                })
-            else:
-            # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
-                essl_has_real_punches = bool(essl_in) or bool(essl_out)
-                tata_has_real_punches = bool(tata_in) or bool(tata_out)
-                if not essl_has_real_punches and tata_has_real_punches:
-                    essl_in_val = tata_in
-                    essl_out_val = tata_out
-                else:
-                    essl_in_val = essl_in
-                    essl_out_val = essl_out
-                attendance_to_insert.append({
-                    "employee_id": emp.id, "pr_number": emp.pr_number, "emp_code": emp.emp_code, "date": d,
-                    "essl_in": essl_in_val, "essl_out": essl_out_val, "tata_in": tata_in, "tata_out": tata_out,
-                    "final_in": final_in, "final_out": final_out, "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
-                    "ot_hours": ot_hours, "ot_headcount": ot_headcount, "attendance_status": display_status,
-                    "late_minutes": late_minutes, "early_minutes": early_minutes, "single_punch": single_punch,
-                    "is_match": "Yes" if match_status == "Matched" else "No", "match_status": match_status,
-                    "vendor": emp.vendor, "store": emp.store, "department": emp.department,
-                    "shift": shift, "category": category, "remark": remark, "issue": issue, "source": "reconciliation"
-                })
-                totals["attendance_records_created"] += 1
-
-            action_checks = [
-                ("Single Punch", display_status == "Single Punch", "Medium", "HR Manager",
-                 f"{emp.name} ({emp.pr_number}) has single punch on {d_iso}"),
-                ("Late Punch", late_minutes > 0, "Low", "Supervisor",
-                 f"{emp.name} ({emp.pr_number}) punched {late_minutes} minutes late on {d_iso}"),
-                ("Early Departure", early_minutes > 0, "Low", "Supervisor",
-                 f"{emp.name} ({emp.pr_number}) left {early_minutes} minutes early on {d_iso}"),
-                ("Less Working Hours", display_status == "Less Working Hours", "Medium", "HR Manager",
-                 f"{emp.name} ({emp.pr_number}) worked {worked_hours}hrs instead of {get_standard_hours(shift)}hrs on {d_iso}"),
-                ("Reconciliation", match_status != "Matched",
-                 "High" if reconciliation_severity in ["Critical", "High"] else "Medium", "HR Manager",
-                 f"{emp.name} ({emp.pr_number}) has {match_status} on {d_iso}. ESSL: {essl_in}-{essl_out}, Tata: {tata_in}-{tata_out}")
-            ]
-
-            for action_type, condition, priority, assigned_to, description in action_checks:
-                if condition:
-                    action_key = (emp.pr_number, d_iso, action_type)
-                    if action_key not in action_map:
-                        actions_to_insert.append({
-                            "pr_number": emp.pr_number, "emp_name": emp.name, "date": d,
-                            "action_type": action_type, "description": description,
-                            "priority": priority, "assigned_to": assigned_to
+                if ot_headcount > 0 and summary["is_ot_eligible"]:
+                    ot_key = (emp.pr_number, d_iso)
+                    if ot_key not in ot_map:
+                        ot_to_insert.append({
+                            "employee_id": emp.id, "pr_number": emp.pr_number, "name": emp.name,
+                            "store": emp.store, "date": d, "worked_hours": worked_hours,
+                            "ot_hours": ot_hours, "calc_headcount": ot_headcount, "status": "Pending"
                         })
                         totals["hr_actions_created"] += 1
 
-            if ot_headcount > 0 and summary["is_ot_eligible"]:
-                ot_key = (emp.pr_number, d_iso)
-                if ot_key not in ot_map:
-                    ot_to_insert.append({
-                        "employee_id": emp.id, "pr_number": emp.pr_number, "name": emp.name,
-                        "store": emp.store, "date": d, "worked_hours": worked_hours,
-                        "ot_hours": ot_hours, "calc_headcount": ot_headcount, "status": "Pending"
-                    })
-                    totals["hr_actions_created"] += 1
+            days_processed += 1
+            _set_job_stage(job_id, f"processed {days_processed}/{total_days_in_month} day(s) in memory")
+            d += timedelta(days=1)
 
-        days_processed += 1
-        _set_job_stage(job_id, f"processed {days_processed}/{total_days_in_month} day(s) in memory")
-        d += timedelta(days=1)
+        _set_job_stage(job_id, "writing results to database")
 
-    _set_job_stage(job_id, "writing results to database")
+        # FIX v3.2: Bulk insert everything at once
+        # FIX v3.2.11: this was the actual cause of the 300s timeout. On a re-run (most
+        # days already have an Attendance row from a prior reconciliation), the old code
+        # mutated ~30,000 already-persistent ORM objects directly, which makes SQLAlchemy
+        # issue one individual UPDATE per row at commit() - very slow, especially over the
+        # network to a hosted Postgres instance. bulk_update_mappings() below does it as a
+        # handful of fast batched statements instead.
+        # FIX: bulk_insert_mappings works from plain dicts and skips ORM instrumentation/
+        # identity-map bookkeeping entirely (unlike bulk_save_objects, which still builds
+        # a full mapped object per row first). For 20-30k rows/month this is a meaningful
+        # chunk of the "writing results to database" stage.
+        if attendance_to_insert:
+            db.bulk_insert_mappings(Attendance, attendance_to_insert)
+        if attendance_updates:
+            db.bulk_update_mappings(Attendance, attendance_updates)
+        if recon_to_insert:
+            db.bulk_insert_mappings(AttendanceReconciliation, recon_to_insert)
+        if actions_to_insert:
+            db.bulk_insert_mappings(HRAction, actions_to_insert)
+        if ot_to_insert:
+            db.bulk_insert_mappings(Overtime, ot_to_insert)
+            # Accumulate newly-created OT rows into the whole-month tracker used by the
+            # post-processing OT-threshold check below, before this chunk's local
+            # ot_to_insert list goes out of scope. These are plain dicts (for
+            # bulk_insert_mappings), so dict-key access is required here.
+            for o in ot_to_insert:
+                if o["ot_hours"] and o["ot_hours"] > 0:
+                    month_ot_by_pr.setdefault(o["pr_number"], []).append((o["date"], o["ot_hours"]))
 
-    # FIX v3.2: Bulk insert everything at once
-    # FIX v3.2.11: this was the actual cause of the 300s timeout. On a re-run (most
-    # days already have an Attendance row from a prior reconciliation), the old code
-    # mutated ~30,000 already-persistent ORM objects directly, which makes SQLAlchemy
-    # issue one individual UPDATE per row at commit() - very slow, especially over the
-    # network to a hosted Postgres instance. bulk_update_mappings() below does it as a
-    # handful of fast batched statements instead.
-    # FIX: bulk_insert_mappings works from plain dicts and skips ORM instrumentation/
-    # identity-map bookkeeping entirely (unlike bulk_save_objects, which still builds
-    # a full mapped object per row first). For 20-30k rows/month this is a meaningful
-    # chunk of the "writing results to database" stage.
-    if attendance_to_insert:
-        db.bulk_insert_mappings(Attendance, attendance_to_insert)
-    if attendance_updates:
-        db.bulk_update_mappings(Attendance, attendance_updates)
-    if recon_to_insert:
-        db.bulk_insert_mappings(AttendanceReconciliation, recon_to_insert)
-    if actions_to_insert:
-        db.bulk_insert_mappings(HRAction, actions_to_insert)
-    if ot_to_insert:
-        db.bulk_insert_mappings(Overtime, ot_to_insert)
+        db.commit()
+        chunk_start = chunk_end
 
-    db.commit()
 
     _set_job_stage(job_id, "checking OT thresholds")
 
@@ -3521,14 +3566,16 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
     # FIX: this used to call check_ot_thresholds() - 2 SUM queries + up to 2 existence
     # queries - once per employee PER DAY that had OT. For a full month with many
     # employees on OT, that was easily thousands of extra round-trips. Now computed
-    # once from data already in memory, plus 2 bulk existence queries total.
-    month_ot_by_pr: Dict[str, List[tuple]] = {}
-    for o in all_ot:  # existing Overtime rows for the month (already fetched above)
-        if o.ot_hours and o.ot_hours > 0:
-            month_ot_by_pr.setdefault(o.pr_number, []).append((o.date, o.ot_hours))
-    for o in ot_to_insert:  # newly created this run
-        if o.ot_hours and o.ot_hours > 0:
-            month_ot_by_pr.setdefault(o.pr_number, []).append((o.date, o.ot_hours))
+    # once from data already in memory (month_ot_by_pr, accumulated incrementally as
+    # each chunk was processed above), plus 2 bulk existence queries total.
+    #
+    # NOTE: month_ot_by_pr is intentionally NOT rebuilt here from all_ot/ot_to_insert -
+    # those are chunk-local variables that no longer exist once the chunk loop above
+    # has finished, and the previous version of this block additionally had a latent
+    # bug where it accessed ot_to_insert entries (plain dicts, for bulk_insert_mappings)
+    # via attribute syntax (o.ot_hours) instead of dict-key syntax (o["ot_hours"]),
+    # which would raise AttributeError and fail the job whenever new OT records were
+    # created during the run.
 
     if month_ot_by_pr:
         prs_with_ot = list(month_ot_by_pr.keys())
@@ -3625,6 +3672,32 @@ def run_reconciliation_month(month: str = Form(...)):
     for jid in [j for j, v in RECONCILIATION_JOBS.items()
                 if v["status"] != "running" and v.get("finished_at", datetime.now()) < cutoff]:
         del RECONCILIATION_JOBS[jid]
+
+    # CONCURRENCY GUARD: without this, clicking "Run Whole Month" (or "Please retry"
+    # after a stalled/failed job) while a PREVIOUS job's background thread is still
+    # alive spawns a second thread writing to the same Attendance/Reconciliation/
+    # HRAction/Overtime rows. Threads are daemon=True and are never actually killed
+    # just because the frontend gave up polling them or the job was marked "failed"
+    # by the stall-detector below - so the old thread can still be mid-transaction,
+    # holding row locks that the new run's writes then queue behind indefinitely.
+    # This is the most likely explanation for a job that stalls specifically at the
+    # "writing results to database" stage rather than erroring outright: it is
+    # waiting on a lock held by an earlier, still-running (or zombie) job, not a
+    # dropped connection. Returning the existing job_id instead of starting a
+    # second thread makes retries safe.
+    existing_running = next((jid for jid, v in RECONCILIATION_JOBS.items() if v["status"] == "running"), None)
+    if existing_running:
+        running_job = RECONCILIATION_JOBS[existing_running]
+        return {
+            "status": "already_running",
+            "job_id": existing_running,
+            "month": running_job["month"],
+            "stage": running_job.get("stage"),
+            "detail": (f"A reconciliation job for {running_job['month']} is already in progress "
+                       f"(stage: {running_job.get('stage')}). Poll this job_id instead of starting "
+                       f"a new one; starting a second job while one is running can cause both to "
+                       f"block each other on the same database rows.")
+        }
 
     job_id = str(uuid.uuid4())
     RECONCILIATION_JOBS[job_id] = {
