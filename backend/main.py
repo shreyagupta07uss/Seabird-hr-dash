@@ -1828,9 +1828,34 @@ def delete_upload(upload_id: int, db: Session = Depends(get_db)):
 
         db.commit()
 
+    # FIX: uploads made BEFORE upload_log_id existed have NULL on every row, so the
+    # cascade filters above match nothing for them - the delete "succeeds" but only
+    # removes the UploadLog row itself, leaving all the actual data behind. That's
+    # confusing ("it just deletes the log"), so detect it and say so honestly instead
+    # of claiming a full cascade delete happened.
+    total_rows_touched = essl_deleted + tata_deleted + employees_deleted + sum(derived_deleted.values())
+    untracked = (file_type in ("master", "essl", "tata", "daywise")) and total_rows_touched == 0
+
     # Delete the log itself
     db.delete(log)
     db.commit()
+
+    if untracked:
+        return {
+            "status": "log_only_deleted",
+            "id": upload_id,
+            "file_type": file_type,
+            "essl_rows_deleted": 0, "tata_rows_deleted": 0,
+            "employees_deleted": 0, "derived_data_deleted": derived_deleted,
+            "message": (
+                f"This upload predates change-tracking (upload_log_id), so I could not "
+                f"identify which rows it created - only the log entry was removed. "
+                f"The underlying data is still in the database. "
+                f"To actually remove it, use 'Clear Month' (DELETE /api/v1/attendance/clear-month"
+                f"?month=YYYY-MM) for the affected month, or re-upload the corrected file with "
+                f"force=true to overwrite it in place."
+            )
+        }
 
     return {
         "status": "deleted",
@@ -1868,6 +1893,61 @@ def _clear_derived_data(start: date, end: date, db: Session):
     db.commit()
 
 
+@app.delete("/api/v1/system/reset-all")
+def reset_all_data(confirm: str = Query(...), db: Session = Depends(get_db)):
+    """NUCLEAR OPTION: wipes EVERYTHING - all attendance data, all reconciliation
+    results, all HR actions/OT, all upload logs, AND all Employee/Vendor/Store/
+    Department master data. This is what "delete all with master" means - a full
+    reset back to an empty database.
+
+    Does NOT touch the User table (login credentials) - you'd otherwise lock
+    yourself out of the admin panel.
+
+    Requires ?confirm=DELETE_EVERYTHING to run, since this is irreversible and
+    there is no undo. Deletes child tables before Employee to satisfy the
+    employee_id foreign keys on Attendance/ESSLAttendance/TataAttendance/Overtime.
+    """
+    if confirm != "DELETE_EVERYTHING":
+        raise HTTPException(
+            status_code=400,
+            detail="This permanently deletes ALL data including master/Employee records. "
+                   "Call again with ?confirm=DELETE_EVERYTHING to proceed."
+        )
+
+    counts = {}
+    # Children first (FK: employee_id -> employees.id), then parents, then
+    # standalone tables. Order matters for Postgres FK constraints.
+    for model, key in [
+        (HRAction, "hr_actions"),
+        (LatePunchPenalty, "late_punch_penalties"),
+        (BehavioralAlert, "behavioral_alerts"),
+        (AttendanceReconciliation, "reconciliation"),
+        (Overtime, "overtime"),
+        (Attendance, "attendance"),
+        (ESSLAttendance, "essl"),
+        (TataAttendance, "tata"),
+        (MonthlyTataAttendance, "monthly_tata"),
+        (UploadLog, "upload_logs"),
+        (Employee, "employees"),
+        (Vendor, "vendors"),
+        (Store, "stores"),
+        (Department, "departments"),
+    ]:
+        counts[key] = db.query(model).delete(synchronize_session=False)
+    db.commit()
+
+    return {
+        "status": "reset_complete",
+        "rows_deleted": counts,
+        "total_rows_deleted": sum(counts.values()),
+        "message": (
+            "Everything wiped: all attendance/reconciliation/HR/overtime data, all "
+            "upload logs, and all master data (employees, vendors, stores, departments). "
+            "Your login (User table) was left intact. Start fresh with a Master upload."
+        )
+    }
+
+
 @app.delete("/api/v1/attendance/clear-month")
 def clear_month_data(month: str = Query(...), db: Session = Depends(get_db)):
     """Wipe ALL derived reconciliation data for a month. Use before re-running reconciliation
@@ -1877,6 +1957,46 @@ def clear_month_data(month: str = Query(...), db: Session = Depends(get_db)):
     end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
     _clear_derived_data(start, end, db)
     return {"status": "cleared", "month": month, "message": f"All Attendance/Reconciliation/Actions/OT for {month} deleted. Upload fresh ESSL/Tata and re-run reconciliation."}
+
+
+@app.delete("/api/v1/attendance/clear-month-raw")
+def clear_month_raw_data(month: str = Query(...), db: Session = Depends(get_db)):
+    """FULL WIPE for a month, by DATE RANGE rather than upload_log_id - this is the
+    fix for data uploaded before upload_log_id tracking existed (e.g. the original
+    June dataset), where per-upload delete can't identify which rows to remove
+    because they were never tagged. This deletes:
+    - Raw ESSLAttendance + TataAttendance rows in the month
+    - All derived Attendance/Reconciliation/HRAction/Overtime/LatePunchPenalty/BehavioralAlert
+    It does NOT touch Employee/master data - use a fresh master upload with force=true
+    to fix employee records instead.
+    """
+    year, mon = parse_year_month(month)
+    start = date(year, mon, 1)
+    end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+
+    essl_deleted = db.query(ESSLAttendance).filter(
+        ESSLAttendance.date >= start, ESSLAttendance.date < end
+    ).delete(synchronize_session=False)
+    tata_deleted = db.query(TataAttendance).filter(
+        TataAttendance.date >= start, TataAttendance.date < end
+    ).delete(synchronize_session=False)
+    db.commit()
+
+    _clear_derived_data(start, end, db)
+
+    return {
+        "status": "cleared",
+        "month": month,
+        "essl_rows_deleted": essl_deleted,
+        "tata_rows_deleted": tata_deleted,
+        "message": (
+            f"Fully wiped raw + derived attendance data for {month} ({essl_deleted} ESSL rows, "
+            f"{tata_deleted} Tata rows). Employees/master data untouched. "
+            f"Old Upload History entries for this month will still be listed (they're just log "
+            f"records now) - deleting them individually is safe and will correctly report nothing "
+            f"left to remove. Re-upload ESSL/Tata for {month} and re-run reconciliation."
+        )
+    }
 
 
 @app.post("/api/v1/upload/master")
@@ -5620,73 +5740,48 @@ def purge_inactive_employees(db: Session = Depends(get_db)):
 def nuke_all_employees(db: Session = Depends(get_db)):
     """NUCLEAR OPTION: Delete ALL employees from the database.
 
-    Deletes child tables first (to avoid FK violations), then employees.
+    Uses raw SQL TRUNCATE with CASCADE to bypass FK constraints.
     Uploads and vendors/stores are preserved.
 
     WARNING: This cannot be undone."""
+    from sqlalchemy import text
+
+    # Step 1: TRUNCATE all derived tables with CASCADE (PostgreSQL) 
+    # This is faster than DELETE and handles FK constraints automatically
+    tables = [
+        "attendance", "attendance_reconciliation", "hr_actions", 
+        "overtime", "late_punch_penalties", "behavioral_alerts", 
+        "monthly_tata_attendance"
+    ]
+    for table in tables:
+        try:
+            db.execute(text(f'TRUNCATE TABLE {table} CASCADE'))
+        except Exception:
+            # If TRUNCATE fails (e.g. SQLite), fall back to DELETE
+            pass
+    db.commit()
+
+    # Step 2: Also try DELETE as fallback for SQLite
     try:
-        # Delete in dependency order: child tables first
         db.query(Attendance).delete(synchronize_session=False)
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    try:
         db.query(AttendanceReconciliation).delete(synchronize_session=False)
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    try:
         db.query(HRAction).delete(synchronize_session=False)
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    try:
         db.query(Overtime).delete(synchronize_session=False)
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    try:
         db.query(LatePunchPenalty).delete(synchronize_session=False)
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    try:
         db.query(BehavioralAlert).delete(synchronize_session=False)
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    try:
         db.query(MonthlyTataAttendance).delete(synchronize_session=False)
         db.commit()
     except Exception:
         db.rollback()
 
-    try:
-        db.query(ESSLAttendance).delete(synchronize_session=False)
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    try:
-        db.query(TataAttendance).delete(synchronize_session=False)
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    # Now safe to delete employees
+    # Step 3: Delete all employees
     count = db.query(Employee).delete(synchronize_session=False)
     db.commit()
 
     return {
         "status": "nuked",
         "employees_deleted": count,
-        "message": f"Deleted ALL {count} employees and all their data. Upload a fresh Master to rebuild the roster."
+        "message": f"Deleted ALL {count} employees and all their derived data. Upload a fresh Master to rebuild the roster."
     }
 
 @app.post("/api/v1/admin/nuke-derived")
