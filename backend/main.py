@@ -204,6 +204,7 @@ class ESSLAttendance(Base):
     vendor = Column(String(50))
     store = Column(String(50))
     shift = Column(String(10))
+    upload_log_id = Column(Integer, index=True, nullable=True)  # which upload created/last-touched this row
     created_at = Column(DateTime, default=datetime.utcnow)
     employee = relationship("Employee", back_populates="essl_records")
 
@@ -227,6 +228,7 @@ class TataAttendance(Base):
     store = Column(String(50))
     department = Column(String(50))
     shift = Column(String(10))
+    upload_log_id = Column(Integer, index=True, nullable=True)  # which upload created/last-touched this row
     created_at = Column(DateTime, default=datetime.utcnow)
     employee = relationship("Employee", back_populates="tata_records")
 
@@ -324,6 +326,26 @@ class UploadLog(Base):
     error_message = Column(Text)
     uploaded_at = Column(DateTime, default=datetime.utcnow)
 
+def safe_log_upload(db: Session, file_type: str, filename: str, file_hash: str,
+                     rows_processed: int, status: str = "Success", error_message: Optional[str] = None) -> Dict[str, Any]:
+    """Write an UploadLog row without ever letting a logging failure turn into a
+    silent, unlogged 500. If this insert/commit itself fails, we catch it, roll
+    back just this log write (not the caller's already-committed data), and
+    return the real error so the endpoint can put it in the HTTP response body
+    instead of it vanishing into server logs no one is watching."""
+    try:
+        db.add(UploadLog(file_type=file_type, filename=filename, file_hash=file_hash,
+                          rows_processed=rows_processed, status=status, error_message=error_message))
+        db.commit()
+        return {"logged": True}
+    except Exception as log_err:
+        db.rollback()
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[UPLOAD LOG FAILED] file_type={file_type} filename={filename} error={log_err}")
+        print(tb)
+        return {"logged": False, "log_error": str(log_err), "log_traceback": tb}
+
 class Overtime(Base):
     __tablename__ = "overtime"
     id = Column(Integer, primary_key=True, index=True)
@@ -380,9 +402,18 @@ class User(Base):
 Base.metadata.create_all(bind=engine)
 
 def _run_lightweight_migrations():
+    is_sqlite = DATABASE_URL.startswith("sqlite")
     with engine.begin() as conn:
         for table in Base.metadata.sorted_tables:
-            existing_cols = {row[1] for row in conn.exec_driver_sql(f'PRAGMA table_info("{table.name}")')}
+            if is_sqlite:
+                existing_cols = {row[1] for row in conn.exec_driver_sql(f'PRAGMA table_info("{table.name}")')}
+            else:
+                existing_cols = {
+                    row[0] for row in conn.exec_driver_sql(
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = %(t)s",
+                        {"t": table.name}
+                    )
+                }
             if not existing_cols:
                 continue
             for column in table.columns:
@@ -391,8 +422,7 @@ def _run_lightweight_migrations():
                     conn.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {col_type}')
                     print(f"[MIGRATE] Added column {table.name}.{column.name}")
 
-if DATABASE_URL.startswith("sqlite"):
-    _run_lightweight_migrations()
+_run_lightweight_migrations()
 
 
 def get_db():
@@ -1721,25 +1751,80 @@ def get_upload_history(db: Session = Depends(get_db)):
 
 @app.delete("/api/v1/upload/{upload_id}")
 def delete_upload(upload_id: int, db: Session = Depends(get_db)):
-    """Removes an entry from Upload History and clears its file_hash so the same file
-    can be re-uploaded without being blocked as a duplicate.
+    """Deletes an Upload History entry AND the underlying attendance rows that upload
+    created/touched (for ESSL, Tata, and Daywise uploads, which tag every row they
+    write with upload_log_id). Also clears the file_hash so the same file can be
+    re-uploaded without being blocked as a duplicate.
 
-    NOTE: this does NOT delete the attendance rows that upload created - the data
-    tables (TataAttendance, ESSLAttendance, etc.) don't currently track which upload
-    each row came from, so there's no reliable way to know which rows to remove without
-    re-processing the original file. If you need "undo this upload's data" as well,
-    that needs a schema change (an upload_log_id column on each attendance table) - say
-    the word and it can be added.
+    NOTE: Master and Tata-All (monthly summary) uploads, and any upload made before
+    upload_log_id tracking was added, don't have tagged rows to delete - only the log
+    entry is removed for those. After deleting ESSL/Tata data, re-run reconciliation
+    for the affected dates so derived tables (Attendance, Reconciliation, Overtime,
+    HR Actions) reflect the change - this endpoint does not recalculate them.
     """
     log = db.query(UploadLog).filter(UploadLog.id == upload_id).first()
     if not log:
         raise HTTPException(status_code=404, detail="Upload not found")
+
+    essl_deleted = db.query(ESSLAttendance).filter(ESSLAttendance.upload_log_id == upload_id).delete(synchronize_session=False)
+    tata_deleted = db.query(TataAttendance).filter(TataAttendance.upload_log_id == upload_id).delete(synchronize_session=False)
+
+    file_type = log.file_type
     db.delete(log)
     db.commit()
-    return {"status": "deleted", "id": upload_id}
+
+    total_deleted = essl_deleted + tata_deleted
+    if total_deleted > 0:
+        message = (f"Deleted upload log and {total_deleted} attendance row(s) "
+                    f"({essl_deleted} ESSL, {tata_deleted} Tata). "
+                    f"Re-run reconciliation for the affected dates to update derived tables.")
+    elif file_type in ("essl", "tata", "daywise"):
+        message = ("Deleted upload log entry, but found 0 tagged attendance rows for it - "
+                    "this upload likely predates upload_log_id tracking, so its data "
+                    "could not be identified for deletion.")
+    else:
+        message = ("Deleted upload log entry. Master and Tata-All uploads aren't tagged for "
+                    "row-level deletion, so no attendance/employee data was removed.")
+
+    return {
+        "status": "deleted", "id": upload_id,
+        "essl_rows_deleted": essl_deleted, "tata_rows_deleted": tata_deleted,
+        "message": message
+    }
+
+
+# FIX: Frontend might call /uploads/ (plural). This alias prevents 404s.
+@app.delete("/api/v1/uploads/{upload_id}")
+def delete_upload_alias(upload_id: int, db: Session = Depends(get_db)):
+    """Alias for /api/v1/upload/{upload_id} — fixes frontend 404s."""
+    return delete_upload(upload_id, db)
+
+
+def _clear_derived_data(start: date, end: date, db: Session):
+    """Nuclear option: wipe Attendance, Reconciliation, HRAction, Overtime for a date range.
+    Use this before re-running reconciliation on a month that has stale data."""
+    db.query(Attendance).filter(Attendance.date >= start, Attendance.date < end).delete(synchronize_session=False)
+    db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date >= start, AttendanceReconciliation.date < end).delete(synchronize_session=False)
+    db.query(HRAction).filter(HRAction.date >= start, HRAction.date < end).delete(synchronize_session=False)
+    db.query(Overtime).filter(Overtime.date >= start, Overtime.date < end).delete(synchronize_session=False)
+    db.query(LatePunchPenalty).filter(LatePunchPenalty.month == start.strftime("%Y-%m")).delete(synchronize_session=False)
+    db.query(BehavioralAlert).filter(BehavioralAlert.month == start.strftime("%Y-%m")).delete(synchronize_session=False)
+    db.commit()
+
+
+@app.delete("/api/v1/attendance/clear-month")
+def clear_month_data(month: str = Query(...), db: Session = Depends(get_db)):
+    """Wipe ALL derived reconciliation data for a month. Use before re-running reconciliation
+    if your data looks corrupted or has ghost employees."""
+    year, mon = parse_year_month(month)
+    start = date(year, mon, 1)
+    end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+    _clear_derived_data(start, end, db)
+    return {"status": "cleared", "month": month, "message": f"All Attendance/Reconciliation/Actions/OT for {month} deleted. Upload fresh ESSL/Tata and re-run reconciliation."}
+
 
 @app.post("/api/v1/upload/master")
-def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+def upload_master(file: UploadFile = File(...), force: bool = Form(False), deactivate_missing: bool = Form(False), db: Session = Depends(get_db)):
     # NOTE: sync `def` (not async) so Starlette runs this in a worker thread instead of
     # blocking the single event loop for the whole upload - fixes ERR_HTTP2_PING_FAILED /
     # "CORS" errors on large files, since the server can still answer keepalive pings.
@@ -1765,8 +1850,13 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: S
     existing_vendor_names = {v.name for v in db.query(Vendor.name).all()}
     existing_store_names = {s.name for s in db.query(Store.name).all()}
 
+    seen_prs = set()
+
     for row in rows:
         pr = str(row.get("PR", row.get("pr_number", row.get("PR Number", row.get("PR_Number", ""))))).strip()
+        if not pr:
+            continue
+        seen_prs.add(pr)
         bio_val = row.get("Bio", row.get("BioID", None))
         bio_id = str(bio_val).strip() if bio_val not in (None, "") else ""
         name = str(row.get("Name", row.get("EMP Name", row.get("Employee Name", "")))).strip()
@@ -1774,9 +1864,6 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: S
         store_name = normalize_store(str(row.get("Store", row.get("store", row.get("Location", "")))).strip())
         category = normalize_category(str(row.get("WC/BC", row.get("Category", row.get("category", "")))).strip())
         status_val = str(row.get("Status", row.get("status", "ACTIVE"))).strip().upper() or "ACTIVE"
-
-        if not pr:
-            continue
 
         if vendor_name and vendor_name not in existing_vendor_names:
             db.add(Vendor(name=vendor_name))
@@ -1811,11 +1898,25 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), db: S
             emp_by_pr[pr] = new_emp  # so a duplicate PR later in the same file updates, not re-inserts
         processed += 1
 
+    # CRITICAL FIX: Employees who are ACTIVE in DB but NOT in this master file are
+    # marked INACTIVE. This stops reconciliation from creating attendance rows for
+    # employees who left the company.
+    deactivated_count = 0
+    if deactivate_missing:
+        for pr, emp in emp_by_pr.items():
+            if pr not in seen_prs and emp.status == "ACTIVE":
+                emp.status = "INACTIVE"
+                deactivated_count += 1
+
     db.commit()
-    db.add(UploadLog(file_type="master", filename=file.filename, file_hash=file_hash, rows_processed=processed, status="Success"))
-    db.commit()
-    return {"status": "success", "type": "master", "rows_processed": processed,
-            "vendors_created": vendors_created, "stores_created": stores_created, "filename": file.filename}
+    log_result = safe_log_upload(db, "master", file.filename, file_hash, processed, "Success")
+    return {
+        "status": "success", "type": "master", "rows_processed": processed,
+        "vendors_created": vendors_created, "stores_created": stores_created,
+        "deactivated_employees": deactivated_count,
+        "filename": file.filename,
+        "upload_log": log_result
+    }
 
 @app.post("/api/v1/upload/essl")
 def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
@@ -1918,6 +2019,11 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
         to_insert = []
         to_update = []
 
+        upload_log = UploadLog(file_type="essl", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Processing")
+        db.add(upload_log)
+        db.flush()  # assigns upload_log.id within this same transaction, without committing yet
+        upload_log_id = upload_log.id
+
         for emp_code, emp_name, att_date, in_time, out_time, essl_status in parsed_rows:
             emp = resolve_employee_fast(emp_code, emp_name)
             pr_number = emp.pr_number if emp else emp_code
@@ -1947,6 +2053,7 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
                     "vendor": emp.vendor if emp else "",
                     "store": emp.store if emp else "",
                     "shift": safe_shift(emp.shift) if emp else "G",
+                    "upload_log_id": upload_log_id,
                 })
             processed += 1
 
@@ -1960,13 +2067,14 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
                 ESSLAttendance.in_time: upd["in_time"] or ESSLAttendance.in_time,
                 ESSLAttendance.out_time: upd["out_time"] or ESSLAttendance.out_time,
                 ESSLAttendance.status: upd["status"] or ESSLAttendance.status,
+                ESSLAttendance.upload_log_id: upload_log_id,
             }, synchronize_session=False)
 
-        db.commit()
-        db.add(UploadLog(file_type="essl", filename=file.filename, file_hash=file_hash, rows_processed=processed, status="Success"))
+        upload_log.status = "Success"
+        upload_log.rows_processed = processed
         db.commit()
         elapsed = round(time_module.time() - start_time, 2)
-        return {"status": "success", "type": "essl", "format": "flat", "rows_processed": processed, "elapsed_seconds": elapsed, "filename": file.filename}
+        return {"status": "success", "type": "essl", "format": "flat", "rows_processed": processed, "elapsed_seconds": elapsed, "filename": file.filename, "upload_log_id": upload_log_id}
 
     # CROSS-TAB FORMAT
     header_row = raw_rows[header_row_idx]
@@ -2115,6 +2223,11 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     to_insert = []
     to_update = []
 
+    upload_log = UploadLog(file_type="essl", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Processing")
+    db.add(upload_log)
+    db.flush()
+    upload_log_id = upload_log.id
+
     for emp_code, emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches in all_records:
         emp = resolve_employee_fast(emp_code, emp_name)
         pr_number = emp.pr_number if emp else emp_code
@@ -2146,6 +2259,7 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
                 "vendor": emp.vendor if emp else "",
                 "store": emp.store if emp else "",
                 "shift": safe_shift(shift),
+                "upload_log_id": upload_log_id,
             })
         processed += 1
 
@@ -2160,17 +2274,18 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
             ESSLAttendance.out_time: upd["out_time"] or ESSLAttendance.out_time,
             ESSLAttendance.status: upd["status"] or ESSLAttendance.status,
             ESSLAttendance.raw_punches: upd["raw_punches"] or ESSLAttendance.raw_punches,
+            ESSLAttendance.upload_log_id: upload_log_id,
         }, synchronize_session=False)
 
+    upload_log.status = "Success"
+    upload_log.rows_processed = processed
     db.commit()
     elapsed = round(time_module.time() - start_time, 2)
-    db.add(UploadLog(file_type="essl", filename=file.filename, file_hash=file_hash, rows_processed=processed, status="Success"))
-    db.commit()
 
     return {
         "status": "success", "type": "essl", "format": "cross-tab", "rows_processed": processed,
         "employees_found": len(set(r[0] for r in all_records)), "date_columns": len(date_columns),
-        "elapsed_seconds": elapsed, "filename": file.filename
+        "elapsed_seconds": elapsed, "filename": file.filename, "upload_log_id": upload_log_id
     }
 
 @app.post("/api/v1/upload/tata")
@@ -2252,6 +2367,11 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     processed = 0
     pending_inserts = {}  # key -> row dict, for new rows not yet in the DB or existing_map
 
+    upload_log = UploadLog(file_type="tata", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Processing")
+    db.add(upload_log)
+    db.flush()
+    upload_log_id = upload_log.id
+
     for item in parsed:
         paycode = item["paycode"]; att_date = item["att_date"]
         in_time = item["in_time"]; out_time = item["out_time"]; man_hrs = item["man_hrs"]
@@ -2292,6 +2412,7 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
             existing_tata.ot_hours = ot_result["calculated_ot_hours"]
             existing_tata.shift = safe_shift(shift)
             existing_tata.department = dept_from_row or division_from_row or existing_tata.department
+            existing_tata.upload_log_id = upload_log_id
         elif key in pending_inserts:
             # duplicate paycode+date appearing again later in the same file - update in place
             pend = pending_inserts[key]
@@ -2311,20 +2432,22 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
                 vendor=normalize_vendor(item["contractor_raw"] or (emp.vendor if emp else "")),
                 store=item["store_raw"] or (emp.store if emp else ""),
                 department=dept_from_row or division_from_row or (emp.department if emp else ""),
-                shift=safe_shift(shift)
+                shift=safe_shift(shift),
+                upload_log_id=upload_log_id
             )
         processed += 1
 
     if pending_inserts:
         db.execute(TataAttendance.__table__.insert(), list(pending_inserts.values()))
 
-    db.commit()
-    db.add(UploadLog(file_type="tata", filename=file.filename, file_hash=file_hash, rows_processed=processed, status="Success"))
+    upload_log.status = "Success"
+    upload_log.rows_processed = processed
     db.commit()
     elapsed = round(time_module.time() - start_time, 2)
     return {"status": "success", "type": "tata", "rows_processed": processed,
             "sheets_read": sheets_read, "sheets_skipped": sheets_skipped, "elapsed_seconds": elapsed,
-            "filename": file.filename, "message": "Official attendance stored. Ready for reconciliation."}
+            "filename": file.filename, "message": "Official attendance stored. Ready for reconciliation.",
+            "upload_log_id": upload_log_id}
 
 @app.post("/api/v1/upload/tata-all")
 def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
@@ -2395,10 +2518,10 @@ def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db:
             ))
 
     db.commit()
-    db.add(UploadLog(file_type="tata_all", filename=file.filename, file_hash=file_hash, rows_processed=len(monthly_data), status="Success"))
-    db.commit()
+    log_result = safe_log_upload(db, "tata_all", file.filename, file_hash, len(monthly_data), "Success")
     return {"status": "success", "type": "tata_all", "monthly_records_created": len(monthly_data),
-            "filename": file.filename, "message": "Monthly attendance summary stored for trends and reports."}
+            "filename": file.filename, "message": "Monthly attendance summary stored for trends and reports.",
+            "upload_log": log_result}
 
 # ============================================================================
 # DAY-WISE COMBINED UPLOAD (ESSL In / ESSL Out / Tata in one workbook)
@@ -2501,6 +2624,11 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
             return emp_by_name[name_val.strip().upper()]
         return None
 
+    upload_log = UploadLog(file_type="daywise", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Processing")
+    db.add(upload_log)
+    db.flush()
+    upload_log_id = upload_log.id
+
     # ---- ESSL In / Out ----
     essl_processed = 0
     if essl_in_ws is not None or essl_out_ws is not None:
@@ -2521,11 +2649,13 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
                 existing_essl.in_time = safe_time(in_time) or existing_essl.in_time
                 existing_essl.out_time = safe_time(out_time) or existing_essl.out_time
                 existing_essl.status = safe_shift(essl_status) or existing_essl.status
+                existing_essl.upload_log_id = upload_log_id
             else:
                 db.add(ESSLAttendance(
                     employee_id=emp.id if emp else None, pr_number=prn, emp_code=prn, emp_name=name_val,
                     date=resolved_date, in_time=safe_time(in_time), out_time=safe_time(out_time), status=safe_shift(essl_status) if essl_status else None,
-                    vendor=emp.vendor if emp else "", store=emp.store if emp else "", shift=safe_shift(emp.shift) if emp else "G"
+                    vendor=emp.vendor if emp else "", store=emp.store if emp else "", shift=safe_shift(emp.shift) if emp else "G",
+                    upload_log_id=upload_log_id
                 ))
             essl_processed += 1
             if essl_processed % 500 == 0:
@@ -2582,6 +2712,7 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
             existing_tata.ot_hours = ot_result["calculated_ot_hours"]
             existing_tata.shift = safe_shift(shift)
             existing_tata.department = dept_from_row or division_from_row or existing_tata.department
+            existing_tata.upload_log_id = upload_log_id
         else:
             new_tata = TataAttendance(
                 employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=emp_name,
@@ -2591,7 +2722,8 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
                 vendor=normalize_vendor(str(row.get("Contractor", emp.vendor if emp else ""))),
                 store=str(row.get("Store", emp.store if emp else "")).strip(),
                 department=dept_from_row or division_from_row or (emp.department if emp else ""),
-                shift=safe_shift(shift)
+                shift=safe_shift(shift),
+                upload_log_id=upload_log_id
             )
             db.add(new_tata)
             existing_tata_map[pr_number] = new_tata  # guard against a dup paycode later in the same file
@@ -2614,10 +2746,17 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
                     if val and isinstance(val, str) and len(val) > 50:
                         print(f"[DAYWISE LONG STRING] {obj.__tablename__}.{col.name} = {val[:100]}...")
         raise HTTPException(status_code=500, detail=f"Database commit failed: {str(commit_err)}")
-    wb.close()
 
-    db.add(UploadLog(file_type="daywise", filename=file.filename, file_hash=file_hash,
-                      rows_processed=essl_processed + tata_processed, status="Success"))
+    # Data is already committed above at this point. wb.close() failing here must
+    # NOT be allowed to turn into an unhandled 500 that hides a successful upload -
+    # so it's wrapped rather than left to raise directly like before.
+    try:
+        wb.close()
+    except Exception as close_err:
+        print(f"[DAYWISE] wb.close() failed after successful commit (non-fatal): {close_err}")
+
+    upload_log.status = "Success"
+    upload_log.rows_processed = essl_processed + tata_processed
     db.commit()
 
     return {
@@ -2625,7 +2764,8 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
         "sheets_found": {"essl_in": essl_in_ws is not None, "essl_out": essl_out_ws is not None, "tata": tata_ws is not None},
         "essl_rows_processed": essl_processed, "tata_rows_processed": tata_processed,
         "filename": file.filename,
-        "message": f"Day-wise attendance stored for {resolved_date.isoformat()}. Run reconciliation for this date next."
+        "message": f"Day-wise attendance stored for {resolved_date.isoformat()}. Run reconciliation for this date next.",
+        "upload_log_id": upload_log_id
     }
 
 # ============================================================================
@@ -2726,14 +2866,24 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
         tata_status = tata.status if tata else None
         essl_status = _get_essl_status(essl)
 
+        # Sunday handling: Sundays default to Week Off unless Tata shows the employee
+        # actually worked (has a Tata record) - see Present override further below.
+        is_sunday = d.weekday() == 6  # Monday=0 ... Sunday=6
+
         # FIX v3.2.8: If employee has NO ESSL and NO Tata data, create "Absent" record with issue "No Data"
         if not essl and not tata:
             shift = safe_shift(emp.shift) if emp.shift else "G"
             category = emp.wc or "BC"
-            display_status = "Absent"
-            issue = "No Data"
-            match_status = "No Data"
-            remark = "No ESSL or Tata record found for this date"
+            if is_sunday:
+                display_status = "Week Off"
+                issue = "Week Off"
+                match_status = "Week Off"
+                remark = "Sunday - Week Off (no attendance data)"
+            else:
+                display_status = "Absent"
+                issue = "No Data"
+                match_status = "No Data"
+                remark = "No ESSL or Tata record found for this date"
 
             existing_att = att_map.get(emp.pr_number)
             if existing_att:
@@ -2889,6 +3039,12 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
         # FIX v3.2.7: Override to "Week Off" if ESSL says WO and no punches
         if essl_status == "WO" and not has_any_punches:
             display_status = "Week Off"
+
+        # Sunday + Tata data present -> employee worked, must show Present regardless of
+        # what the generic shift/hours calculation produced.
+        if is_sunday and tata:
+            display_status = "Present"
+            attendance_status = "P"
 
         # FIX v3.2.4: Status stays "Present" for Late Punch, Early Departure, etc.
         # The Issue column captures the specific problem. Only Present/Absent as main status.
@@ -3056,6 +3212,17 @@ def run_reconciliation(target_date: str = Form(...), db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail="Invalid date format")
     return _reconcile_single_date(d, db)
 
+@app.post("/api/v1/reconciliation/run-date")
+def run_reconciliation_date(target_date: str = Form(...), clean: bool = Form(False), db: Session = Depends(get_db)):
+    """Reconcile ONE day synchronously (no background thread). Returns in <10s.
+    Use clean=true to wipe that day's derived data first."""
+    d = parse_date_br(target_date)
+    if not d:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    if clean:
+        _clear_derived_data(d, d + timedelta(days=1), db)
+    return _reconcile_single_date(d, db)
+
 # ============================================================================
 # BACKGROUND JOB TRACKING for month-long reconciliation.
 #
@@ -3111,7 +3278,7 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
     # The actual per-day row data is then fetched CHUNK_DAYS days at a time in
     # the loop below, so peak memory is bounded by one chunk's worth of rows
     # instead of the whole month's, regardless of workforce size.
-    CHUNK_DAYS = 5
+    CHUNK_DAYS = 3
 
     essl_prs_month = {
         pr for (pr,) in db.query(ESSLAttendance.pr_number).filter(
@@ -3224,14 +3391,24 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                 tata_status = tata.status if tata else None
                 essl_status = _get_essl_status(essl)
 
+                # Sunday handling: Sundays default to Week Off unless Tata shows the employee
+                # actually worked (has a Tata record) - see Present override further below.
+                is_sunday = d.weekday() == 6  # Monday=0 ... Sunday=6
+
                 # FIX v3.2.8: If employee has NO ESSL and NO Tata data, create "Absent" record
                 if not essl and not tata:
                     shift = safe_shift(emp.shift) if emp.shift else "G"
                     category = emp.wc or "BC"
-                    display_status = "Absent"
-                    issue = "No Data"
-                    match_status = "No Data"
-                    remark = "No ESSL or Tata record found for this date"
+                    if is_sunday:
+                        display_status = "Week Off"
+                        issue = "Week Off"
+                        match_status = "Week Off"
+                        remark = "Sunday - Week Off (no attendance data)"
+                    else:
+                        display_status = "Absent"
+                        issue = "No Data"
+                        match_status = "No Data"
+                        remark = "No ESSL or Tata record found for this date"
 
                     att_key = (emp.pr_number, d_iso)
                     if att_key in att_map:
@@ -3383,6 +3560,12 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                 # FIX v3.2.7: Override to "Week Off" if ESSL says WO and no punches
                 if essl_status == "WO" and not has_any_punches:
                     display_status = "Week Off"
+
+                # Sunday + Tata data present -> employee worked, must show Present regardless of
+                # what the generic shift/hours calculation produced.
+                if is_sunday and tata:
+                    display_status = "Present"
+                    attendance_status = "P"
 
                 # FIX v3.2.4: Status stays "Present" for Late Punch, Early Departure, etc.
                 # The Issue column captures the specific problem. Only Present/Absent as main status.
@@ -3643,12 +3826,16 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
         **totals
     }
 
-def _run_reconciliation_job(job_id: str, month: str):
-    """Runs on a background thread with its own DB session (the request-scoped
-    session from Depends(get_db) is closed by the time this executes, since the
-    triggering request has already returned)."""
+def _run_reconciliation_job(job_id: str, month: str, clean: bool = False):
+    """Runs on a background thread with its own DB session."""
     job_db = SessionLocal()
     try:
+        if clean:
+            year, mon = parse_year_month(month)
+            start = date(year, mon, 1)
+            end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+            _clear_derived_data(start, end, job_db)
+
         result = _run_reconciliation_month_core(month, job_db, job_id=job_id)
         RECONCILIATION_JOBS[job_id]["status"] = "completed"
         RECONCILIATION_JOBS[job_id]["result"] = result
@@ -3656,35 +3843,27 @@ def _run_reconciliation_job(job_id: str, month: str):
         RECONCILIATION_JOBS[job_id]["finished_at"] = datetime.now()
     except Exception as e:
         job_db.rollback()
+        import traceback
+        tb = traceback.format_exc()
         RECONCILIATION_JOBS[job_id]["status"] = "failed"
-        RECONCILIATION_JOBS[job_id]["error"] = str(e)
+        RECONCILIATION_JOBS[job_id]["error"] = f"{str(e)}\n\n{tb}"
         RECONCILIATION_JOBS[job_id]["finished_at"] = datetime.now()
     finally:
         job_db.close()
 
 @app.post("/api/v1/reconciliation/run-month")
-def run_reconciliation_month(month: str = Form(...)):
-    """Kicks off month reconciliation as a background job and returns immediately.
-    Poll GET /api/v1/reconciliation/run-month/{job_id} for progress/result - see the
-    comment above RECONCILIATION_JOBS for why this isn't a single synchronous request."""
-    # Prune old finished jobs so this dict doesn't grow forever over the life of the process.
+def run_reconciliation_month(month: str = Form(...), clean: bool = Form(False)):
+    """Kicks off month reconciliation as a background job.
+
+    Set clean=true to wipe all existing Attendance/Reconciliation/HRAction/OT
+    for this month before re-running. Use this if your data looks corrupted.
+    """
+    # Prune old finished jobs
     cutoff = datetime.now() - timedelta(hours=2)
     for jid in [j for j, v in RECONCILIATION_JOBS.items()
                 if v["status"] != "running" and v.get("finished_at", datetime.now()) < cutoff]:
         del RECONCILIATION_JOBS[jid]
 
-    # CONCURRENCY GUARD: without this, clicking "Run Whole Month" (or "Please retry"
-    # after a stalled/failed job) while a PREVIOUS job's background thread is still
-    # alive spawns a second thread writing to the same Attendance/Reconciliation/
-    # HRAction/Overtime rows. Threads are daemon=True and are never actually killed
-    # just because the frontend gave up polling them or the job was marked "failed"
-    # by the stall-detector below - so the old thread can still be mid-transaction,
-    # holding row locks that the new run's writes then queue behind indefinitely.
-    # This is the most likely explanation for a job that stalls specifically at the
-    # "writing results to database" stage rather than erroring outright: it is
-    # waiting on a lock held by an earlier, still-running (or zombie) job, not a
-    # dropped connection. Returning the existing job_id instead of starting a
-    # second thread makes retries safe.
     existing_running = next((jid for jid, v in RECONCILIATION_JOBS.items() if v["status"] == "running"), None)
     if existing_running:
         running_job = RECONCILIATION_JOBS[existing_running]
@@ -3693,10 +3872,7 @@ def run_reconciliation_month(month: str = Form(...)):
             "job_id": existing_running,
             "month": running_job["month"],
             "stage": running_job.get("stage"),
-            "detail": (f"A reconciliation job for {running_job['month']} is already in progress "
-                       f"(stage: {running_job.get('stage')}). Poll this job_id instead of starting "
-                       f"a new one; starting a second job while one is running can cause both to "
-                       f"block each other on the same database rows.")
+            "detail": f"A reconciliation job for {running_job['month']} is already in progress."
         }
 
     job_id = str(uuid.uuid4())
@@ -3705,9 +3881,9 @@ def run_reconciliation_month(month: str = Form(...)):
         "result": None, "error": None, "started_at": datetime.now(), "finished_at": None,
         "stage_updated_at": datetime.now()
     }
-    thread = threading.Thread(target=_run_reconciliation_job, args=(job_id, month), daemon=True)
+    thread = threading.Thread(target=_run_reconciliation_job, args=(job_id, month, clean), daemon=True)
     thread.start()
-    return {"status": "started", "job_id": job_id, "month": month}
+    return {"status": "started", "job_id": job_id, "month": month, "clean": clean}
 
 @app.get("/api/v1/reconciliation/run-month/{job_id}")
 def get_reconciliation_month_job(job_id: str):
