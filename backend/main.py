@@ -5620,22 +5620,41 @@ def purge_inactive_employees(db: Session = Depends(get_db)):
 def nuke_all_employees(db: Session = Depends(get_db)):
     """NUCLEAR OPTION: Delete ALL employees from the database.
 
-    First clears ALL derived data (attendance, reconciliation, actions, OT, penalties,
-    alerts, monthly summaries) to remove foreign key references, then deletes all
-    employees. Uploads and vendors/stores are preserved.
+    Uses raw SQL TRUNCATE with CASCADE to bypass FK constraints.
+    Uploads and vendors/stores are preserved.
 
     WARNING: This cannot be undone."""
-    # Step 1: Clear ALL derived tables that reference employees via FK
-    db.query(Attendance).delete(synchronize_session=False)
-    db.query(AttendanceReconciliation).delete(synchronize_session=False)
-    db.query(HRAction).delete(synchronize_session=False)
-    db.query(Overtime).delete(synchronize_session=False)
-    db.query(LatePunchPenalty).delete(synchronize_session=False)
-    db.query(BehavioralAlert).delete(synchronize_session=False)
-    db.query(MonthlyTataAttendance).delete(synchronize_session=False)
+    from sqlalchemy import text
+
+    # Step 1: TRUNCATE all derived tables with CASCADE (PostgreSQL) 
+    # This is faster than DELETE and handles FK constraints automatically
+    tables = [
+        "attendance", "attendance_reconciliation", "hr_actions", 
+        "overtime", "late_punch_penalties", "behavioral_alerts", 
+        "monthly_tata_attendance"
+    ]
+    for table in tables:
+        try:
+            db.execute(text(f'TRUNCATE TABLE {table} CASCADE'))
+        except Exception:
+            # If TRUNCATE fails (e.g. SQLite), fall back to DELETE
+            pass
     db.commit()
 
-    # Step 2: Now safe to delete all employees (no FK references left)
+    # Step 2: Also try DELETE as fallback for SQLite
+    try:
+        db.query(Attendance).delete(synchronize_session=False)
+        db.query(AttendanceReconciliation).delete(synchronize_session=False)
+        db.query(HRAction).delete(synchronize_session=False)
+        db.query(Overtime).delete(synchronize_session=False)
+        db.query(LatePunchPenalty).delete(synchronize_session=False)
+        db.query(BehavioralAlert).delete(synchronize_session=False)
+        db.query(MonthlyTataAttendance).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    # Step 3: Delete all employees
     count = db.query(Employee).delete(synchronize_session=False)
     db.commit()
 
