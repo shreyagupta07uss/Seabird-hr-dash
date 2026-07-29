@@ -2292,46 +2292,8 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
         "all_sheets": sheet_pick["all_sheets"]
     }
 
-@app.post("/api/v1/upload/essl")
-def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
-    import time as time_module
-    start_time = time_module.time()
-
-    contents = file.file.read()
-    file_hash = hashlib.sha256(contents).hexdigest()
-    if not force:
-        existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
-        if existing:
-            return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
-
-    try:
-        raw_rows = read_excel_raw_rows(contents)
-    except Exception as e:
-        db.add(UploadLog(file_type="essl", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
-        db.commit()
-        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
-
-    if not raw_rows or len(raw_rows) < 2:
-        raise HTTPException(status_code=400, detail="Empty or invalid Excel file")
-
-    all_employees = db.query(Employee).all()
-    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
-    emp_by_name = {}
-    for e in all_employees:
-        if e.name:
-            emp_by_name[e.name.strip().upper()] = e
-    emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
-
-    def resolve_employee_fast(emp_code_val: str, emp_name_val: str):
-        e = emp_by_pr.get(emp_code_val)
-        if e:
-            return e
-        if emp_name_val:
-            e = emp_by_name.get(emp_name_val.strip().upper())
-            if e:
-                return e
-        return emp_by_code.get(emp_code_val)
-
+def _parse_essl_crosstab_sheet(raw_rows: List[List[Any]]) -> tuple[List[tuple], set, Optional[int]]:
+    """Parse a single ESSL cross-tab sheet. Returns (records, dates, header_row_idx_or_none)."""
     header_row_idx = None
     date_columns = []
     for i, row in enumerate(raw_rows[:15]):
@@ -2352,8 +2314,192 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
                         date_columns.append((j, parsed))
             break
 
-    # FLAT FORMAT FALLBACK
     if header_row_idx is None:
+        return [], set(), None
+
+    header_row = raw_rows[header_row_idx]
+    emp_code_col = emp_name_col = shift_col = None
+    for j, cell in enumerate(header_row):
+        if cell is None:
+            continue
+        cell_str = str(cell).strip().upper()
+        if any(x in cell_str for x in ["EMP CODE", "EMP_CODE", "CODE", "PAYCODE", "PAY CODE", "EMP.CODE"]):
+            emp_code_col = j
+        elif any(x in cell_str for x in ["EMP NAME", "EMP_NAME", "NAME", "EMPLOYEE NAME", "EMPLOYEE_NAME"]):
+            emp_name_col = j
+        elif cell_str in ["SHIFT", "SFT"]:
+            shift_col = j
+
+    if emp_code_col is None:
+        emp_code_col = 0
+    if emp_name_col is None:
+        emp_name_col = 1
+
+    current_emp_code = None
+    current_emp_name = ""
+    current_shift = "G"
+    current_in_row = {}
+    current_out_row = {}
+    current_other_rows = {}
+    all_records = []
+    all_dates = set()
+
+    for i in range(header_row_idx + 1, len(raw_rows)):
+        row = raw_rows[i]
+        if len(row) < 3:
+            continue
+        first_val = row[emp_code_col] if emp_code_col < len(row) else None
+        has_code = False
+        if first_val is not None and str(first_val).strip() not in ["", "-", "#N/A", "N/A"]:
+            first_str = str(first_val).strip()
+            if re.match(r'^[A-Z0-9]+$', first_str) and first_str not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT"]:
+                has_code = True
+
+        if has_code:
+            emp_code = str(first_val).strip()
+            if current_emp_code and current_emp_code != emp_code and date_columns:
+                for col_idx, att_date in date_columns:
+                    date_key = att_date.isoformat()
+                    raw_in = current_in_row.get(date_key)
+                    raw_out = current_out_row.get(date_key)
+                    in_time = parse_time_br(raw_in)
+                    out_time = parse_time_br(raw_out)
+                    essl_status = None
+                    if raw_in and raw_in.upper() in ESSL_STATUS_MARKERS:
+                        essl_status = raw_in.upper()
+                    elif raw_out and raw_out.upper() in ESSL_STATUS_MARKERS:
+                        essl_status = raw_out.upper()
+                    raw_punches = {}
+                    for rt, vals in current_other_rows.items():
+                        if date_key in vals:
+                            key = {"TOTAL": "total_hours", "OT": "ot_hours", "STATUS": "status",
+                                   "REMARKS": "remark", "REMARK": "remark", "SHIFT": "shift", "SFT": "shift"}.get(rt, rt.lower())
+                            raw_punches[key] = vals[date_key]
+                    if essl_status:
+                        raw_punches["essl_status"] = essl_status
+                    shift = current_other_rows.get("SHIFT", {}).get(date_key) or current_other_rows.get("SFT", {}).get(date_key) or current_shift
+                    all_records.append((current_emp_code, current_emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches))
+                    all_dates.add(att_date)
+                current_in_row = {}
+                current_out_row = {}
+                current_other_rows = {}
+            current_emp_code = emp_code
+            current_emp_name = str(row[emp_name_col]).strip() if emp_name_col < len(row) and row[emp_name_col] else ""
+            current_shift = "G"
+            if shift_col is not None and shift_col < len(row) and row[shift_col]:
+                current_shift = normalize_shift(str(row[shift_col]).strip())
+        if not current_emp_code:
+            continue
+        row_type = None
+        for j in range(min(10, len(row))):
+            cell = row[j]
+            if cell is not None:
+                cell_str = str(cell).strip().upper()
+                if cell_str in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT"]:
+                    row_type = cell_str
+                    break
+        if not row_type:
+            continue
+        # Skip repeating header rows between employee blocks (e.g. "Remarks | 2026-06-01 | 2026-06-02...")
+        if not has_code and row_type in ("REMARKS", "REMARK"):
+            is_header_repeat = False
+            for col_idx, att_date in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    val_str = str(row[col_idx]).strip()
+                    if re.match(r'\d{4}-\d{2}-\d{2}', val_str) or re.match(r'\d{2}/\d{2}/\d{4}', val_str):
+                        is_header_repeat = True
+                        break
+            if is_header_repeat:
+                continue
+        target_dict = current_in_row if row_type == "IN" else current_out_row if row_type == "OUT" else current_other_rows.setdefault(row_type, {})
+        for col_idx, att_date in date_columns:
+            if col_idx >= len(row):
+                continue
+            val = row[col_idx]
+            if val is None or str(val).strip() in ["", "-", "#N/A", "N/A", "NA"]:
+                continue
+            target_dict[att_date.isoformat()] = str(val).strip()
+
+    # Flush last employee
+    if current_emp_code and date_columns:
+        for col_idx, att_date in date_columns:
+            date_key = att_date.isoformat()
+            raw_in = current_in_row.get(date_key)
+            raw_out = current_out_row.get(date_key)
+            in_time = parse_time_br(raw_in)
+            out_time = parse_time_br(raw_out)
+            essl_status = None
+            if raw_in and raw_in.upper() in ESSL_STATUS_MARKERS:
+                essl_status = raw_in.upper()
+            elif raw_out and raw_out.upper() in ESSL_STATUS_MARKERS:
+                essl_status = raw_out.upper()
+            raw_punches = {}
+            for rt, vals in current_other_rows.items():
+                if date_key in vals:
+                    key = {"TOTAL": "total_hours", "OT": "ot_hours", "STATUS": "status",
+                           "REMARKS": "remark", "REMARK": "remark", "SHIFT": "shift", "SFT": "shift"}.get(rt, rt.lower())
+                    raw_punches[key] = vals[date_key]
+            if essl_status:
+                raw_punches["essl_status"] = essl_status
+            shift = current_other_rows.get("SHIFT", {}).get(date_key) or current_other_rows.get("SFT", {}).get(date_key) or current_shift
+            all_records.append((current_emp_code, current_emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches))
+            all_dates.add(att_date)
+
+    return all_records, all_dates, header_row_idx
+
+
+@app.post("/api/v1/upload/essl")
+def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
+    import time as time_module
+    start_time = time_module.time()
+
+    contents = file.file.read()
+    file_hash = hashlib.sha256(contents).hexdigest()
+    if not force:
+        existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
+        if existing:
+            return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
+
+    try:
+        wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
+    except Exception as e:
+        db.add(UploadLog(file_type="essl", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
+        db.commit()
+        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
+
+    all_employees = db.query(Employee).all()
+    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
+    emp_by_name = {}
+    for e in all_employees:
+        if e.name:
+            emp_by_name[e.name.strip().upper()] = e
+    emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
+
+    def resolve_employee_fast(emp_code_val: str, emp_name_val: str):
+        e = emp_by_pr.get(emp_code_val)
+        if e:
+            return e
+        if emp_name_val:
+            e = emp_by_name.get(emp_name_val.strip().upper())
+            if e:
+                return e
+        return emp_by_code.get(emp_code_val)
+
+    # Process ALL sheets — accumulate cross-tab records from every sheet that has one
+    all_records = []
+    all_dates = set()
+    sheets_processed = 0
+    for ws in wb.worksheets:
+        raw_rows = list(ws.iter_rows(values_only=True))
+        sheet_records, sheet_dates, header_idx = _parse_essl_crosstab_sheet(raw_rows)
+        if header_idx is not None:
+            all_records.extend(sheet_records)
+            all_dates.update(sheet_dates)
+            sheets_processed += 1
+    wb.close()
+
+    # FLAT FORMAT FALLBACK: no cross-tab sheets found in any worksheet
+    if not all_records:
         try:
             rows = read_excel_bytes_to_dicts(contents)
         except Exception as e:
@@ -2450,151 +2596,6 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
         elapsed = round(time_module.time() - start_time, 2)
         return {"status": "success", "type": "essl", "format": "flat", "rows_processed": processed, "elapsed_seconds": elapsed, "filename": file.filename, "upload_log_id": upload_log_id}
 
-    # CROSS-TAB FORMAT
-    header_row = raw_rows[header_row_idx]
-    emp_code_col = emp_name_col = shift_col = None
-    for j, cell in enumerate(header_row):
-        if cell is None:
-            continue
-        cell_str = str(cell).strip().upper()
-        if any(x in cell_str for x in ["EMP CODE", "EMP_CODE", "CODE", "PAYCODE", "PAY CODE", "EMP.CODE"]):
-            emp_code_col = j
-        elif any(x in cell_str for x in ["EMP NAME", "EMP_NAME", "NAME", "EMPLOYEE NAME", "EMPLOYEE_NAME"]):
-            emp_name_col = j
-        elif cell_str in ["SHIFT", "SFT"]:
-            shift_col = j
-
-    if emp_code_col is None:
-        emp_code_col = 0
-    if emp_name_col is None:
-        emp_name_col = 1
-
-    current_emp_code = None
-    current_emp_name = ""
-    current_shift = "G"
-    current_in_row = {}
-    current_out_row = {}
-    current_other_rows = {}
-    all_records = []
-    all_dates = set()
-
-    for i in range(header_row_idx + 1, len(raw_rows)):
-        row = raw_rows[i]
-        if len(row) < 3:
-            continue
-        first_val = row[emp_code_col] if emp_code_col < len(row) else None
-        # FIX v3.1 (preserved): IN/OUT rows repeat the emp code in col A - check if it is a real new employee block
-        has_code = False
-        if first_val is not None and str(first_val).strip() not in ["", "-", "#N/A", "N/A"]:
-            first_str = str(first_val).strip()
-            # Only treat as new employee if the value looks like an employee code (alphanumeric, not just a time/status)
-            if re.match(r'^[A-Z0-9]+$', first_str) and first_str not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT"]:
-                has_code = True
-
-        if has_code:
-            emp_code = str(first_val).strip()
-            if current_emp_code and current_emp_code != emp_code and date_columns:
-                # Flush previous employee before starting new one
-                for col_idx, att_date in date_columns:
-                    date_key = att_date.isoformat()
-                    raw_in = current_in_row.get(date_key)
-                    raw_out = current_out_row.get(date_key)
-                    in_time = parse_time_br(raw_in)
-                    out_time = parse_time_br(raw_out)
-
-                    # FIX v3.2: Detect ESSL status from raw IN/OUT values
-                    essl_status = None
-                    if raw_in and raw_in.upper() in ESSL_STATUS_MARKERS:
-                        essl_status = raw_in.upper()
-                    elif raw_out and raw_out.upper() in ESSL_STATUS_MARKERS:
-                        essl_status = raw_out.upper()
-
-                    raw_punches = {}
-                    for rt, vals in current_other_rows.items():
-                        if date_key in vals:
-                            key = {"TOTAL": "total_hours", "OT": "ot_hours", "STATUS": "status",
-                                   "REMARKS": "remark", "REMARK": "remark", "SHIFT": "shift", "SFT": "shift"}.get(rt, rt.lower())
-                            raw_punches[key] = vals[date_key]
-                    if essl_status:
-                        raw_punches["essl_status"] = essl_status
-
-                    shift = current_other_rows.get("SHIFT", {}).get(date_key) or current_other_rows.get("SFT", {}).get(date_key) or current_shift
-                    all_records.append((current_emp_code, current_emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches))
-                    all_dates.add(att_date)
-                # Reset dicts only when flushing previous employee
-                current_in_row = {}
-                current_out_row = {}
-                current_other_rows = {}
-            # Set up new employee (or first employee)
-            current_emp_code = emp_code
-            current_emp_name = str(row[emp_name_col]).strip() if emp_name_col < len(row) and row[emp_name_col] else ""
-            current_shift = "G"
-            if shift_col is not None and shift_col < len(row) and row[shift_col]:
-                current_shift = normalize_shift(str(row[shift_col]).strip())
-            # FIX v3.2.2: Don't continue - let code fall through to process IN row data
-        if not current_emp_code:
-            continue
-        row_type = None
-        for j in range(min(10, len(row))):
-            cell = row[j]
-            if cell is not None:
-                cell_str = str(cell).strip().upper()
-                if cell_str in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT"]:
-                    row_type = cell_str
-                    break
-        # Skip repeating header rows between employee blocks (e.g. "Remarks | 2026-06-01 | 2026-06-02...")
-        if not has_code and row_type in ("REMARKS", "REMARK"):
-            # If any date column contains a full date string, this is a header repeat, not data
-            is_header_repeat = False
-            for col_idx, att_date in date_columns:
-                if col_idx < len(row) and row[col_idx] is not None:
-                    val_str = str(row[col_idx]).strip()
-                    if re.match(r'\d{4}-\d{2}-\d{2}', val_str) or re.match(r'\d{2}/\d{2}/\d{4}', val_str):
-                        is_header_repeat = True
-                        break
-            if is_header_repeat:
-                continue
-
-        if not row_type:
-            continue
-        target_dict = current_in_row if row_type == "IN" else current_out_row if row_type == "OUT" else current_other_rows.setdefault(row_type, {})
-        for col_idx, att_date in date_columns:
-            if col_idx >= len(row):
-                continue
-            val = row[col_idx]
-            if val is None or str(val).strip() in ["", "-", "#N/A", "N/A", "NA"]:
-                continue
-            target_dict[att_date.isoformat()] = str(val).strip()
-
-    # Flush last employee
-    if current_emp_code and date_columns:
-        for col_idx, att_date in date_columns:
-            date_key = att_date.isoformat()
-            raw_in = current_in_row.get(date_key)
-            raw_out = current_out_row.get(date_key)
-            in_time = parse_time_br(raw_in)
-            out_time = parse_time_br(raw_out)
-
-            # FIX v3.2: Detect ESSL status from raw IN/OUT values
-            essl_status = None
-            if raw_in and raw_in.upper() in ESSL_STATUS_MARKERS:
-                essl_status = raw_in.upper()
-            elif raw_out and raw_out.upper() in ESSL_STATUS_MARKERS:
-                essl_status = raw_out.upper()
-
-            raw_punches = {}
-            for rt, vals in current_other_rows.items():
-                if date_key in vals:
-                    key = {"TOTAL": "total_hours", "OT": "ot_hours", "STATUS": "status",
-                           "REMARKS": "remark", "REMARK": "remark", "SHIFT": "shift", "SFT": "shift"}.get(rt, rt.lower())
-                    raw_punches[key] = vals[date_key]
-            if essl_status:
-                raw_punches["essl_status"] = essl_status
-
-            shift = current_other_rows.get("SHIFT", {}).get(date_key) or current_other_rows.get("SFT", {}).get(date_key) or current_shift
-            all_records.append((current_emp_code, current_emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches))
-            all_dates.add(att_date)
-
     existing_keys = set()
     if all_records and all_dates:
         min_date = min(all_dates)
@@ -2671,8 +2672,8 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
 
     return {
         "status": "success", "type": "essl", "format": "cross-tab", "rows_processed": processed,
-        "employees_found": len(set(r[0] for r in all_records)), "date_columns": len(date_columns),
-        "elapsed_seconds": elapsed, "filename": file.filename, "upload_log_id": upload_log_id
+        "employees_found": len(set(r[0] for r in all_records)), "date_columns": len(all_dates),
+        "sheets_processed": sheets_processed, "elapsed_seconds": elapsed, "filename": file.filename, "upload_log_id": upload_log_id
     }
 
 @app.post("/api/v1/upload/tata")
