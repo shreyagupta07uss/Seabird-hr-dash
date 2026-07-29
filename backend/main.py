@@ -103,12 +103,16 @@ else:
     # error - root cause is that a Postgres connection with a dropped/stale socket
     # (Neon idles/drops connections) can hang a query or commit() indefinitely with
     # no default timeout, and threading + in-memory job dict meant nothing ever
-    # surfaced that hang as a failure. statement_timeout bounds any single query,
-    # and TCP keepalives let the OS notice a dead connection instead of waiting
-    # forever on a socket that will never respond.
+    # surfaced that hang as a failure. TCP keepalives let the OS notice a dead
+    # connection instead of waiting forever on a socket that will never respond.
+    #
+    # NOTE: statement_timeout is NOT set via connect_args "options" here - Neon's
+    # pooled (pgbouncer) endpoint rejects unsupported startup parameters and refuses
+    # the connection outright (see neon.tech/docs/connect/connection-errors).
+    # Instead it's set per-session below via a plain SET command after connect,
+    # which pgbouncer passes through fine.
     _pg_connect_args = {
         "sslmode": "require",
-        "options": "-c statement_timeout=120000",  # 120s hard cap per statement
         "keepalives": 1,
         "keepalives_idle": 30,
         "keepalives_interval": 10,
@@ -127,6 +131,12 @@ else:
         pool_timeout=30,         # wait up to 30s for a connection
         connect_args=_pg_connect_args
     )
+
+    @event.listens_for(engine, "connect")
+    def set_pg_statement_timeout(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("SET statement_timeout = 120000")  # 120s hard cap per statement
+        cursor.close()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
