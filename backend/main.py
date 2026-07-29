@@ -1767,6 +1767,61 @@ def get_upload_history(db: Session = Depends(get_db)):
     return [{"id": l.id, "type": l.file_type, "filename": l.filename, "rows_processed": l.rows_processed,
              "status": l.status, "uploaded_at": l.uploaded_at.isoformat()} for l in logs]
 
+
+def _delete_all_upload_data(db: Session) -> Dict[str, int]:
+    """Remove every record derived from uploaded HR files.
+
+    This deliberately leaves application users and settings alone, but clears every
+    table that can make the dashboard show stale employees, attendance, alerts, or
+    upload links.  Delete dependent rows before employees so both SQLite and
+    PostgreSQL foreign-key constraints are satisfied.
+    """
+    deleted = {
+        "essl": db.query(ESSLAttendance).delete(synchronize_session=False),
+        "tata": db.query(TataAttendance).delete(synchronize_session=False),
+        "attendance": db.query(Attendance).delete(synchronize_session=False),
+        "reconciliation": db.query(AttendanceReconciliation).delete(synchronize_session=False),
+        "hr_actions": db.query(HRAction).delete(synchronize_session=False),
+        "overtime": db.query(Overtime).delete(synchronize_session=False),
+        "monthly_tata": db.query(MonthlyTataAttendance).delete(synchronize_session=False),
+        "late_punch_penalties": db.query(LatePunchPenalty).delete(synchronize_session=False),
+        "behavioral_alerts": db.query(BehavioralAlert).delete(synchronize_session=False),
+        "employees": db.query(Employee).delete(synchronize_session=False),
+        "vendors": db.query(Vendor).delete(synchronize_session=False),
+        "stores": db.query(Store).delete(synchronize_session=False),
+        "departments": db.query(Department).delete(synchronize_session=False),
+        "upload_history": db.query(UploadLog).delete(synchronize_session=False),
+    }
+    db.commit()
+    return deleted
+
+
+@app.delete("/api/v1/upload/history")
+@app.delete("/api/v1/uploads")
+def delete_all_uploads(db: Session = Depends(get_db)):
+    """Full dashboard reset used by the UI's 'Delete all uploads' action.
+
+    A later visit to the dashboard will retain data normally.  Only this explicit
+    reset removes all uploaded data and therefore brings employee/dashboard counts
+    back to zero.
+    """
+    try:
+        deleted = _delete_all_upload_data(db)
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "status": "deleted",
+        "message": "All uploads and all dashboard data were permanently deleted.",
+        "deleted": deleted,
+        "remaining": {
+            "employees": db.query(Employee).count(),
+            "uploads": db.query(UploadLog).count(),
+            "attendance": db.query(Attendance).count(),
+        },
+    }
+
 @app.delete("/api/v1/upload/{upload_id}")
 def delete_upload(upload_id: int, db: Session = Depends(get_db)):
     """FULL CASCADE DELETE:
