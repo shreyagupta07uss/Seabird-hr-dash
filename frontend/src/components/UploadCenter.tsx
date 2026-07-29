@@ -81,6 +81,7 @@ export default function UploadCenter() {
     // instead of a generic "uploaded successfully!" alert that hid whether all sheets were read.
     const [lastResult, setLastResult] = useState<UploadResult | null>(null);
     const [deletingId, setDeletingId] = useState<number | null>(null);
+    const [deletingAll, setDeletingAll] = useState(false);
 
     const loadHistory = async () => {
         try {
@@ -136,6 +137,26 @@ export default function UploadCenter() {
             alert(`Failed to delete: ${err.message}`);
         } finally {
             setDeletingId(null);
+        }
+    };
+
+    const handleDeleteAll = async () => {
+        const confirmed = window.confirm(
+            'Delete ALL uploads and reset the dashboard?\n\nThis permanently deletes every uploaded file record, employee, attendance row, reconciliation result, HR action, alert, vendor, store, and department. The dashboard will return to zero employees. This cannot be undone.'
+        );
+        if (!confirmed) return;
+
+        try {
+            setDeletingAll(true);
+            const result = await api.deleteAllUploads();
+            setUploads([]);
+            setLastResult(null);
+            window.dispatchEvent(new CustomEvent('dashboard-data-reset'));
+            alert(`${result.message}\n\nRemaining employees: ${result.remaining.employees}`);
+        } catch (err: any) {
+            alert(`Failed to delete all uploads: ${err.message}`);
+        } finally {
+            setDeletingAll(false);
         }
     };
 
@@ -213,8 +234,18 @@ export default function UploadCenter() {
             )}
 
             <Card>
-                <div className="px-6 py-4 border-b border-slate-100">
+                <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between gap-3">
                     <h3 className="text-sm font-bold text-slate-700">Upload History</h3>
+                    {uploads.length > 0 && (
+                        <Button
+                            variant="danger"
+                            size="sm"
+                            onClick={handleDeleteAll}
+                            loading={deletingAll}
+                        >
+                            Delete All Uploads
+                        </Button>
+                    )}
                 </div>
                 <div className="overflow-x-auto">
                     <table className="w-full text-sm text-left">

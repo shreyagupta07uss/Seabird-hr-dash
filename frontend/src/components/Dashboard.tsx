@@ -132,6 +132,15 @@ export default function Dashboard() {
         return () => clearTimeout(timer);
     }, [selectedDate]);
 
+    // Keep an already-open dashboard in sync when Upload Center performs a full reset.
+    useEffect(() => {
+        const refreshAfterReset = () => {
+            if (selectedDate) loadData(selectedDate);
+        };
+        window.addEventListener('dashboard-data-reset', refreshAfterReset);
+        return () => window.removeEventListener('dashboard-data-reset', refreshAfterReset);
+    }, [selectedDate]);
+
     // Set default date to yesterday on mount
     useEffect(() => {
         const yesterday = new Date();

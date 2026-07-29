@@ -208,6 +208,17 @@ export interface UploadResult {
     };
 }
 
+export interface UploadResetResult {
+    status: string;
+    message: string;
+    deleted: Record<string, number>;
+    remaining: {
+        employees: number;
+        uploads: number;
+        attendance: number;
+    };
+}
+
 export interface PaginatedResponse<T> {
     data: T[];
     total: number;
@@ -585,6 +596,12 @@ export const api = {
 
     deleteUpload: async (id: number): Promise<{ status: string; id: number }> => {
         return fetchJSON(`${API_BASE}/upload/${id}`, {
+            method: 'DELETE'
+        });
+    },
+
+    deleteAllUploads: async (): Promise<UploadResetResult> => {
+        return fetchJSON(`${API_BASE}/uploads`, {
             method: 'DELETE'
         });
     },
