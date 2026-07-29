@@ -2332,8 +2332,40 @@ def _parse_day_header(cell_val: Any, year: int, month: int) -> Optional[date]:
     return None
 
 
+_ESSL_HEADER_LABELS = [
+    "EMP CODE", "EMP_CODE", "PAYCODE", "PAY CODE", "EMP.CODE", "PRN", "BIO",
+    "EMP NAME", "EMPLOYEE NAME", "EMPLOYEE_NAME", "NAME", "DAYS",
+    "REMARKS", "REMARK", "SHIFT", "SFT",
+]
+
+
+def _essl_header_label_hits(row: List[Any], date_col_idxs: set) -> int:
+    """Count how many non-date cells in a row look like known ESSL header labels
+    (EMP Code, PRN, Bio, Name, Days, Remarks, Shift, ...). Used to confirm a row
+    with only 1-2 date columns is genuinely a header row and not a stray data row
+    that happens to contain a date-like value."""
+    hits = 0
+    for j, cell in enumerate(row):
+        if j in date_col_idxs or cell is None:
+            continue
+        h = str(cell).strip().upper()
+        if any(label == h or label in h for label in _ESSL_HEADER_LABELS):
+            hits += 1
+    return hits
+
+
 def _find_essl_header_row(raw_rows: List[List[Any]], filename_month: Optional[Tuple[int, int]] = None) -> Optional[Dict[str, Any]]:
-    """Find and analyze the header row. Returns dict with row_idx, date_cols, meta_cols, format_type."""
+    """Find and analyze the header row. Returns dict with row_idx, date_cols, meta_cols, format_type.
+
+    FIX: some ESSL exports split a month across many small sheets (e.g. a sheet
+    covering just 1-2 days, like "3 In" or "13 In"/"14 In"). The old logic required
+    >=3 date columns to recognize a header row, which silently dropped every sheet
+    with fewer than 3 days of data - a large, invisible source of missing punches
+    whenever the vendor's sheet-splitting pattern changed. Now a row with as few as
+    1 date column is also accepted as a header row, as long as it also has >=2 cells
+    matching known ESSL header labels (EMP Code, PRN, Bio, Name, Days, Remarks,
+    Shift, ...) - this keeps false positives on ordinary data rows out.
+    """
     for i, row in enumerate(raw_rows[:50]):
         if len(row) < 3:
             continue
@@ -2344,13 +2376,15 @@ def _find_essl_header_row(raw_rows: List[List[Any]], filename_month: Optional[Tu
                 parsed = parse_date_br(str(cell).strip())
                 if parsed:
                     full_dates.append((j, parsed))
-        if len(full_dates) >= 3:
-            return {
-                "row_idx": i,
-                "date_cols": full_dates,
-                "meta_cols": [j for j in range(len(row)) if j not in [d[0] for d in full_dates]],
-                "format_type": "full-dates"
-            }
+        if full_dates:
+            date_col_idxs = {d[0] for d in full_dates}
+            if len(full_dates) >= 3 or _essl_header_label_hits(row, date_col_idxs) >= 2:
+                return {
+                    "row_idx": i,
+                    "date_cols": full_dates,
+                    "meta_cols": [j for j in range(len(row)) if j not in date_col_idxs],
+                    "format_type": "full-dates"
+                }
         # Try day-number dates if we know month
         if filename_month:
             year, month = filename_month
@@ -2360,13 +2394,15 @@ def _find_essl_header_row(raw_rows: List[List[Any]], filename_month: Optional[Tu
                     parsed = _parse_day_header(cell, year, month)
                     if parsed:
                         day_dates.append((j, parsed))
-            if len(day_dates) >= 3:
-                return {
-                    "row_idx": i,
-                    "date_cols": day_dates,
-                    "meta_cols": [j for j in range(len(row)) if j not in [d[0] for d in day_dates]],
-                    "format_type": "day-numbers"
-                }
+            if day_dates:
+                date_col_idxs = {d[0] for d in day_dates}
+                if len(day_dates) >= 3 or _essl_header_label_hits(row, date_col_idxs) >= 2:
+                    return {
+                        "row_idx": i,
+                        "date_cols": day_dates,
+                        "meta_cols": [j for j in range(len(row)) if j not in date_col_idxs],
+                        "format_type": "day-numbers"
+                    }
     return None
 
 
