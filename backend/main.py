@@ -5616,6 +5616,23 @@ def purge_inactive_employees(db: Session = Depends(get_db)):
     return {"status": "purged", "employees_deleted": count,
             "message": f"Deleted {count} inactive employees and all their related records."}
 
+@app.post("/api/v1/admin/nuke-employees")
+def nuke_all_employees(db: Session = Depends(get_db)):
+    """NUCLEAR OPTION: Delete ALL employees from the database.
+
+    Use this when you want a completely fresh start. All employee records,
+    their attendance, reconciliation, actions, and overtime history will be gone.
+    Uploads and vendors/stores are preserved.
+
+    WARNING: This cannot be undone."""
+    count = db.query(Employee).delete(synchronize_session=False)
+    db.commit()
+    return {
+        "status": "nuked",
+        "employees_deleted": count,
+        "message": f"Deleted ALL {count} employees. Upload a fresh Master to rebuild the roster."
+    }
+
 @app.post("/api/v1/admin/nuke-derived")
 def nuke_all_derived(
     month: Optional[str] = Query(None, description="YYYY-MM — wipe only this month. Omit to wipe EVERYTHING derived."),
