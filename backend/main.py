@@ -94,9 +94,30 @@ if DATABASE_URL.startswith("sqlite"):
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute("PRAGMA cache_size=10000")
+        # FIX: bounded lock wait instead of relying on default busy_timeout=0 behavior.
+        cursor.execute("PRAGMA busy_timeout=15000")
         cursor.close()
 else:
     # Neon / PostgreSQL: aggressive pool settings to prevent SSL drops
+    # FIX: the reconciliation job was getting stuck forever at "running" with no
+    # error - root cause is that a Postgres connection with a dropped/stale socket
+    # (Neon idles/drops connections) can hang a query or commit() indefinitely with
+    # no default timeout, and threading + in-memory job dict meant nothing ever
+    # surfaced that hang as a failure. statement_timeout bounds any single query,
+    # and TCP keepalives let the OS notice a dead connection instead of waiting
+    # forever on a socket that will never respond.
+    _pg_connect_args = {
+        "sslmode": "require",
+        "options": "-c statement_timeout=120000",  # 120s hard cap per statement
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+        "connect_timeout": 10,
+    }
+    if "sslmode" in DATABASE_URL:
+        _pg_connect_args.pop("sslmode")
+
     engine = create_engine(
         DATABASE_URL,
         pool_pre_ping=True,      # verify connection before use
@@ -104,7 +125,7 @@ else:
         pool_size=6,             # Neon free tier = 10 max concurrent; Dashboard fires up to 7 parallel requests per load
         max_overflow=2,          # allow 2 extra temporarily
         pool_timeout=30,         # wait up to 30s for a connection
-        connect_args={"sslmode": "require"} if "sslmode" not in DATABASE_URL else {}
+        connect_args=_pg_connect_args
     )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -3041,9 +3062,12 @@ def run_reconciliation(target_date: str = Form(...), db: Session = Depends(get_d
 # ============================================================================
 RECONCILIATION_JOBS: Dict[str, Dict[str, Any]] = {}
 
+JOB_STALL_SECONDS = 150  # if a stage hasn't moved in this long, treat the job as dead
+
 def _set_job_stage(job_id: Optional[str], stage: str):
     if job_id and job_id in RECONCILIATION_JOBS:
         RECONCILIATION_JOBS[job_id]["stage"] = stage
+        RECONCILIATION_JOBS[job_id]["stage_updated_at"] = datetime.now()
 
 # FIX v3.2: Completely rewritten with bulk pre-fetch to eliminate timeout
 def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str] = None) -> Dict[str, Any]:
@@ -3181,16 +3205,16 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                         "shift": shift, "category": category, "issue": issue, "remark": remark,
                     })
                 else:
-                    attendance_to_insert.append(Attendance(
-                        employee_id=emp.id, pr_number=emp.pr_number, emp_code=emp.emp_code, date=d,
-                        essl_in=None, essl_out=None, tata_in=None, tata_out=None,
-                        final_in=None, final_out=None, worked_hours=0, man_hrs=0,
-                        ot_hours=0, ot_headcount=0, attendance_status=display_status,
-                        late_minutes=0, early_minutes=0, single_punch="No",
-                        is_match="No", match_status=match_status,
-                        vendor=emp.vendor, store=emp.store, department=emp.department,
-                        shift=shift, category=category, remark=remark, issue=issue, source="reconciliation"
-                    ))
+                    attendance_to_insert.append({
+                        "employee_id": emp.id, "pr_number": emp.pr_number, "emp_code": emp.emp_code, "date": d,
+                        "essl_in": None, "essl_out": None, "tata_in": None, "tata_out": None,
+                        "final_in": None, "final_out": None, "worked_hours": 0, "man_hrs": 0,
+                        "ot_hours": 0, "ot_headcount": 0, "attendance_status": display_status,
+                        "late_minutes": 0, "early_minutes": 0, "single_punch": "No",
+                        "is_match": "No", "match_status": match_status,
+                        "vendor": emp.vendor, "store": emp.store, "department": emp.department,
+                        "shift": shift, "category": category, "remark": remark, "issue": issue, "source": "reconciliation"
+                    })
                     totals["attendance_records_created"] += 1
                 continue
 
@@ -3264,13 +3288,13 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
             if match_status != "Matched":
                 recon_key = (emp.pr_number, d_iso)
                 if recon_key not in recon_map:
-                    recon_to_insert.append(AttendanceReconciliation(
-                        pr_number=emp.pr_number, emp_name=emp.name, date=d,
-                        essl_in=essl_in, essl_out=essl_out, tata_in=tata_in, tata_out=tata_out,
-                        in_delta_minutes=match_delta_in, out_delta_minutes=match_delta_out,
-                        match_status=match_status, severity=reconciliation_severity,
-                        remarks=f"ESSL: {essl_in}-{essl_out}, Tata: {tata_in}-{tata_out}"
-                    ))
+                    recon_to_insert.append({
+                        "pr_number": emp.pr_number, "emp_name": emp.name, "date": d,
+                        "essl_in": essl_in, "essl_out": essl_out, "tata_in": tata_in, "tata_out": tata_out,
+                        "in_delta_minutes": match_delta_in, "out_delta_minutes": match_delta_out,
+                        "match_status": match_status, "severity": reconciliation_severity,
+                        "remarks": f"ESSL: {essl_in}-{essl_out}, Tata: {tata_in}-{tata_out}"
+                    })
                     totals["reconciliation_issues"] += 1
 
             final_in = tata_in or essl_in
@@ -3404,16 +3428,16 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                 else:
                     essl_in_val = essl_in
                     essl_out_val = essl_out
-                attendance_to_insert.append(Attendance(
-                    employee_id=emp.id, pr_number=emp.pr_number, emp_code=emp.emp_code, date=d,
-                    essl_in=essl_in_val, essl_out=essl_out_val, tata_in=tata_in, tata_out=tata_out,
-                    final_in=final_in, final_out=final_out, worked_hours=worked_hours, man_hrs=tata_man_hrs,
-                    ot_hours=ot_hours, ot_headcount=ot_headcount, attendance_status=display_status,
-                    late_minutes=late_minutes, early_minutes=early_minutes, single_punch=single_punch,
-                    is_match="Yes" if match_status == "Matched" else "No", match_status=match_status,
-                    vendor=emp.vendor, store=emp.store, department=emp.department,
-                    shift=shift, category=category, remark=remark, issue=issue, source="reconciliation"
-                ))
+                attendance_to_insert.append({
+                    "employee_id": emp.id, "pr_number": emp.pr_number, "emp_code": emp.emp_code, "date": d,
+                    "essl_in": essl_in_val, "essl_out": essl_out_val, "tata_in": tata_in, "tata_out": tata_out,
+                    "final_in": final_in, "final_out": final_out, "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
+                    "ot_hours": ot_hours, "ot_headcount": ot_headcount, "attendance_status": display_status,
+                    "late_minutes": late_minutes, "early_minutes": early_minutes, "single_punch": single_punch,
+                    "is_match": "Yes" if match_status == "Matched" else "No", "match_status": match_status,
+                    "vendor": emp.vendor, "store": emp.store, "department": emp.department,
+                    "shift": shift, "category": category, "remark": remark, "issue": issue, "source": "reconciliation"
+                })
                 totals["attendance_records_created"] += 1
 
             action_checks = [
@@ -3434,21 +3458,21 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                 if condition:
                     action_key = (emp.pr_number, d_iso, action_type)
                     if action_key not in action_map:
-                        actions_to_insert.append(HRAction(
-                            pr_number=emp.pr_number, emp_name=emp.name, date=d,
-                            action_type=action_type, description=description,
-                            priority=priority, assigned_to=assigned_to
-                        ))
+                        actions_to_insert.append({
+                            "pr_number": emp.pr_number, "emp_name": emp.name, "date": d,
+                            "action_type": action_type, "description": description,
+                            "priority": priority, "assigned_to": assigned_to
+                        })
                         totals["hr_actions_created"] += 1
 
             if ot_headcount > 0 and summary["is_ot_eligible"]:
                 ot_key = (emp.pr_number, d_iso)
                 if ot_key not in ot_map:
-                    ot_to_insert.append(Overtime(
-                        employee_id=emp.id, pr_number=emp.pr_number, name=emp.name,
-                        store=emp.store, date=d, worked_hours=worked_hours,
-                        ot_hours=ot_hours, calc_headcount=ot_headcount, status="Pending"
-                    ))
+                    ot_to_insert.append({
+                        "employee_id": emp.id, "pr_number": emp.pr_number, "name": emp.name,
+                        "store": emp.store, "date": d, "worked_hours": worked_hours,
+                        "ot_hours": ot_hours, "calc_headcount": ot_headcount, "status": "Pending"
+                    })
                     totals["hr_actions_created"] += 1
 
         days_processed += 1
@@ -3464,16 +3488,20 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
     # issue one individual UPDATE per row at commit() - very slow, especially over the
     # network to a hosted Postgres instance. bulk_update_mappings() below does it as a
     # handful of fast batched statements instead.
+    # FIX: bulk_insert_mappings works from plain dicts and skips ORM instrumentation/
+    # identity-map bookkeeping entirely (unlike bulk_save_objects, which still builds
+    # a full mapped object per row first). For 20-30k rows/month this is a meaningful
+    # chunk of the "writing results to database" stage.
     if attendance_to_insert:
-        db.bulk_save_objects(attendance_to_insert)
+        db.bulk_insert_mappings(Attendance, attendance_to_insert)
     if attendance_updates:
         db.bulk_update_mappings(Attendance, attendance_updates)
     if recon_to_insert:
-        db.bulk_save_objects(recon_to_insert)
+        db.bulk_insert_mappings(AttendanceReconciliation, recon_to_insert)
     if actions_to_insert:
-        db.bulk_save_objects(actions_to_insert)
+        db.bulk_insert_mappings(HRAction, actions_to_insert)
     if ot_to_insert:
-        db.bulk_save_objects(ot_to_insert)
+        db.bulk_insert_mappings(Overtime, ot_to_insert)
 
     db.commit()
 
@@ -3525,30 +3553,30 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                 weekly_sum = round(sum(h for dd, h in entries if week_start_i <= dd <= d_i), 2)
                 if weekly_sum > OT_WEEKLY_THRESHOLD and not weekly_alert_added:
                     if not any(week_start_i <= fd <= d_i for fd in already_flagged):
-                        threshold_actions_to_insert.append(HRAction(
-                            pr_number=pr, emp_name=emp.name, date=d_i,
-                            action_type="OT Weekly Threshold",
-                            description=(f"{emp.name} ({pr}) has exceeded the weekly OT limit: "
+                        threshold_actions_to_insert.append({
+                            "pr_number": pr, "emp_name": emp.name, "date": d_i,
+                            "action_type": "OT Weekly Threshold",
+                            "description": (f"{emp.name} ({pr}) has exceeded the weekly OT limit: "
                                          f"{weekly_sum}h / {OT_WEEKLY_THRESHOLD}h (week ending {d_i.isoformat()})"),
-                            priority="High", assigned_to="HR Manager"
-                        ))
+                            "priority": "High", "assigned_to": "HR Manager"
+                        })
                         weekly_alert_added = True
                         totals["hr_actions_created"] += 1
 
             monthly_sum = round(sum(h for _, h in entries), 2)
             if monthly_sum > OT_MONTHLY_THRESHOLD and pr not in existing_monthly_prs:
                 last_date = entries[-1][0]
-                threshold_actions_to_insert.append(HRAction(
-                    pr_number=pr, emp_name=emp.name, date=last_date,
-                    action_type="OT Monthly Threshold",
-                    description=(f"{emp.name} ({pr}) has exceeded the monthly OT limit: "
+                threshold_actions_to_insert.append({
+                    "pr_number": pr, "emp_name": emp.name, "date": last_date,
+                    "action_type": "OT Monthly Threshold",
+                    "description": (f"{emp.name} ({pr}) has exceeded the monthly OT limit: "
                                  f"{monthly_sum}h / {OT_MONTHLY_THRESHOLD}h"),
-                    priority="High", assigned_to="HR Manager"
-                ))
+                    "priority": "High", "assigned_to": "HR Manager"
+                })
                 totals["hr_actions_created"] += 1
 
         if threshold_actions_to_insert:
-            db.bulk_save_objects(threshold_actions_to_insert)
+            db.bulk_insert_mappings(HRAction, threshold_actions_to_insert)
             db.commit()
 
     return {
@@ -3591,7 +3619,8 @@ def run_reconciliation_month(month: str = Form(...)):
     job_id = str(uuid.uuid4())
     RECONCILIATION_JOBS[job_id] = {
         "status": "running", "stage": "queued", "month": month,
-        "result": None, "error": None, "started_at": datetime.now(), "finished_at": None
+        "result": None, "error": None, "started_at": datetime.now(), "finished_at": None,
+        "stage_updated_at": datetime.now()
     }
     thread = threading.Thread(target=_run_reconciliation_job, args=(job_id, month), daemon=True)
     thread.start()
@@ -3602,6 +3631,22 @@ def get_reconciliation_month_job(job_id: str):
     job = RECONCILIATION_JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found (it may have completed a while ago and been cleared, or the server restarted)")
+
+    # FIX: if the background thread died/hung without hitting our except block
+    # (e.g. a hard socket hang before the statement_timeout could even kick in,
+    # or the process was killed), the job would otherwise sit at "running" with
+    # a null finished_at forever, which is exactly what was showing on screen.
+    # Treat "no stage progress for JOB_STALL_SECONDS" as a failure.
+    if job["status"] == "running":
+        last_progress = job.get("stage_updated_at") or job["started_at"]
+        stalled_for = (datetime.now() - last_progress).total_seconds()
+        if stalled_for > JOB_STALL_SECONDS:
+            job["status"] = "failed"
+            job["error"] = (f"Job stalled for over {JOB_STALL_SECONDS}s at stage "
+                             f"'{job.get('stage')}' with no progress - likely a dropped DB "
+                             f"connection. Please retry.")
+            job["finished_at"] = datetime.now()
+
     return job
 
 @app.get("/api/v1/reconciliation/summary")
