@@ -50,7 +50,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query, Fo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, date, timedelta, time
 import json
 import csv
