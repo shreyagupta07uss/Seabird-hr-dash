@@ -63,7 +63,7 @@ import uuid
 import threading
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc
+from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc, text
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship, joinedload
 
@@ -4793,6 +4793,48 @@ def debug_tables(db: Session = Depends(get_db)):
             "last_record_at": last_time
         })
     return {"tables": result, "database": str(DATABASE_URL)}
+
+@app.get("/debug/upload-log-test")
+def debug_upload_log_test(db: Session = Depends(get_db)):
+    """Try to insert+commit a throwaway UploadLog row and report exactly what happens.
+    Also compares the live Postgres schema for upload_logs against the ORM model,
+    so we can see if a column was added at the DB level that the model doesn't know about."""
+    result = {}
+
+    # 1. Compare live schema vs ORM model columns
+    try:
+        rows = db.execute(text(
+            "SELECT column_name, is_nullable, column_default, data_type "
+            "FROM information_schema.columns WHERE table_name = 'upload_logs' "
+            "ORDER BY ordinal_position"
+        )).fetchall()
+        result["live_schema"] = [dict(r._mapping) for r in rows]
+        model_cols = {c.name for c in UploadLog.__table__.columns}
+        live_cols = {r[0] for r in rows}
+        result["columns_in_db_not_in_model"] = list(live_cols - model_cols)
+        result["columns_in_model_not_in_db"] = list(model_cols - live_cols)
+    except Exception as schema_err:
+        result["schema_check_error"] = str(schema_err)
+
+    # 2. Try the actual insert+commit, exactly like the upload endpoints do
+    try:
+        test_log = UploadLog(file_type="debug_test", filename="test.xlsx",
+                              file_hash="debug" + str(datetime.utcnow().timestamp()),
+                              rows_processed=0, status="Success")
+        db.add(test_log)
+        db.commit()
+        result["insert_test"] = "SUCCESS"
+        result["inserted_id"] = test_log.id
+        db.delete(test_log)
+        db.commit()
+    except Exception as insert_err:
+        db.rollback()
+        import traceback
+        result["insert_test"] = "FAILED"
+        result["insert_error"] = str(insert_err)
+        result["insert_traceback"] = traceback.format_exc()
+
+    return result
 
 @app.get("/debug/employee/{pr_number}")
 def debug_employee(pr_number: str, db: Session = Depends(get_db)):
