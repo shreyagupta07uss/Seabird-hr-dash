@@ -522,10 +522,27 @@ async def dynamic_cors_middleware(request, call_next):
     # Handle actual request - add CORS headers even if the endpoint crashes
     try:
         response = await call_next(request)
-    except Exception:
-        # If the endpoint crashed (e.g. DB connection drop), create a 500 response
-        # with CORS headers so the browser doesn't blame CORS
-        response = Response(status_code=500, content="Internal Server Error")
+    except Exception as exc:
+        # FIX: this used to swallow the real exception and return a blank
+        # "Internal Server Error", which is why every crash just showed up in
+        # the browser as "HTTP 500" with no explanation - neither the user nor
+        # anyone debugging it could tell what actually broke. Now we print the
+        # full traceback to server logs (visible in Railway logs) AND include
+        # the real error message + type in the JSON body, so the frontend's
+        # error alert can show something actionable.
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[UNHANDLED EXCEPTION] {request.method} {request.url.path}")
+        print(tb)
+        import json as _json
+        response = Response(
+            status_code=500,
+            content=_json.dumps({
+                "detail": f"{type(exc).__name__}: {str(exc)}",
+                "path": str(request.url.path),
+            }),
+            media_type="application/json"
+        )
 
     response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Access-Control-Allow-Credentials"] = "true"
@@ -1769,11 +1786,17 @@ def delete_upload(upload_id: int, db: Session = Depends(get_db)):
     employees_deleted = 0
 
     if file_type == "master":
-        # DELETE all employees created/updated by this master.
-        # Old master = never existed. These employees should not appear anywhere.
+        # FIX: hard-DELETEing these employees crashes with a Postgres
+        # IntegrityError (foreign key violation) the moment any of them has
+        # attendance/reconciliation/overtime history, since employee_id on
+        # those tables references employees.id and nothing cleans those rows
+        # up first. That's what was producing the unexplained HTTP 500 here.
+        # Soft-delete instead: mark them INACTIVE. This is also just correct
+        # behavior - undoing a master upload shouldn't destroy attendance
+        # history that's already been reconciled against those employee IDs.
         employees_deleted = db.query(Employee).filter(
             Employee.upload_log_id == upload_id
-        ).delete(synchronize_session=False)
+        ).update({"status": "INACTIVE"}, synchronize_session=False)
         db.commit()
 
     elif file_type in ("essl", "tata", "daywise"):
