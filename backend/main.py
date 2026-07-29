@@ -182,6 +182,7 @@ class Employee(Base):
     join_date = Column(Date)
     phone = Column(String(20))
     email = Column(String(100))
+    upload_log_id = Column(Integer, index=True, nullable=True)  # which master upload created/last-updated this employee
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1751,45 +1752,100 @@ def get_upload_history(db: Session = Depends(get_db)):
 
 @app.delete("/api/v1/upload/{upload_id}")
 def delete_upload(upload_id: int, db: Session = Depends(get_db)):
-    """Deletes an Upload History entry AND the underlying attendance rows that upload
-    created/touched (for ESSL, Tata, and Daywise uploads, which tag every row they
-    write with upload_log_id). Also clears the file_hash so the same file can be
-    re-uploaded without being blocked as a duplicate.
-
-    NOTE: Master and Tata-All (monthly summary) uploads, and any upload made before
-    upload_log_id tracking was added, don't have tagged rows to delete - only the log
-    entry is removed for those. After deleting ESSL/Tata data, re-run reconciliation
-    for the affected dates so derived tables (Attendance, Reconciliation, Overtime,
-    HR Actions) reflect the change - this endpoint does not recalculate them.
+    """FULL CASCADE DELETE:
+    - Master: marks all employees from this upload as INACTIVE + deletes the log
+    - ESSL/Tata/Daywise: deletes raw rows + ALL derived data (Attendance, Reconciliation,
+      HRAction, Overtime) for the date range covered by this upload
+    - Tata-All: deletes the log only (monthly summaries are not tagged by upload_log_id)
     """
     log = db.query(UploadLog).filter(UploadLog.id == upload_id).first()
     if not log:
         raise HTTPException(status_code=404, detail="Upload not found")
 
-    essl_deleted = db.query(ESSLAttendance).filter(ESSLAttendance.upload_log_id == upload_id).delete(synchronize_session=False)
-    tata_deleted = db.query(TataAttendance).filter(TataAttendance.upload_log_id == upload_id).delete(synchronize_session=False)
-
     file_type = log.file_type
+    essl_deleted = 0
+    tata_deleted = 0
+    derived_deleted = {"attendance": 0, "reconciliation": 0, "hr_actions": 0, "overtime": 0}
+    employees_deleted = 0
+
+    if file_type == "master":
+        # DELETE all employees created/updated by this master.
+        # Old master = never existed. These employees should not appear anywhere.
+        employees_deleted = db.query(Employee).filter(
+            Employee.upload_log_id == upload_id
+        ).delete(synchronize_session=False)
+        db.commit()
+
+    elif file_type in ("essl", "tata", "daywise"):
+        # Find the date range this upload covered
+        date_range = None
+        if file_type == "essl":
+            date_range = db.query(
+                func.min(ESSLAttendance.date), func.max(ESSLAttendance.date)
+            ).filter(ESSLAttendance.upload_log_id == upload_id).first()
+        elif file_type == "tata":
+            date_range = db.query(
+                func.min(TataAttendance.date), func.max(TataAttendance.date)
+            ).filter(TataAttendance.upload_log_id == upload_id).first()
+        elif file_type == "daywise":
+            essl_range = db.query(
+                func.min(ESSLAttendance.date), func.max(ESSLAttendance.date)
+            ).filter(ESSLAttendance.upload_log_id == upload_id).first()
+            tata_range = db.query(
+                func.min(TataAttendance.date), func.max(TataAttendance.date)
+            ).filter(TataAttendance.upload_log_id == upload_id).first()
+            dates = [d for d in [essl_range[0] if essl_range else None, essl_range[1] if essl_range else None,
+                                 tata_range[0] if tata_range else None, tata_range[1] if tata_range else None] if d]
+            if dates:
+                date_range = (min(dates), max(dates))
+
+        # Delete raw rows
+        essl_deleted = db.query(ESSLAttendance).filter(
+            ESSLAttendance.upload_log_id == upload_id
+        ).delete(synchronize_session=False)
+        tata_deleted = db.query(TataAttendance).filter(
+            TataAttendance.upload_log_id == upload_id
+        ).delete(synchronize_session=False)
+
+        # Delete ALL derived data for the affected date range
+        if date_range and date_range[0] and date_range[1]:
+            start, end = date_range[0], date_range[1] + timedelta(days=1)
+            derived_deleted["attendance"] = db.query(Attendance).filter(
+                Attendance.date >= start, Attendance.date < end
+            ).delete(synchronize_session=False)
+            derived_deleted["reconciliation"] = db.query(AttendanceReconciliation).filter(
+                AttendanceReconciliation.date >= start, AttendanceReconciliation.date < end
+            ).delete(synchronize_session=False)
+            derived_deleted["hr_actions"] = db.query(HRAction).filter(
+                HRAction.date >= start, HRAction.date < end
+            ).delete(synchronize_session=False)
+            derived_deleted["overtime"] = db.query(Overtime).filter(
+                Overtime.date >= start, Overtime.date < end
+            ).delete(synchronize_session=False)
+            month_str = start.strftime("%Y-%m")
+            db.query(LatePunchPenalty).filter(LatePunchPenalty.month == month_str).delete(synchronize_session=False)
+            db.query(BehavioralAlert).filter(BehavioralAlert.month == month_str).delete(synchronize_session=False)
+
+        db.commit()
+
+    # Delete the log itself
     db.delete(log)
     db.commit()
 
-    total_deleted = essl_deleted + tata_deleted
-    if total_deleted > 0:
-        message = (f"Deleted upload log and {total_deleted} attendance row(s) "
-                    f"({essl_deleted} ESSL, {tata_deleted} Tata). "
-                    f"Re-run reconciliation for the affected dates to update derived tables.")
-    elif file_type in ("essl", "tata", "daywise"):
-        message = ("Deleted upload log entry, but found 0 tagged attendance rows for it - "
-                    "this upload likely predates upload_log_id tracking, so its data "
-                    "could not be identified for deletion.")
-    else:
-        message = ("Deleted upload log entry. Master and Tata-All uploads aren't tagged for "
-                    "row-level deletion, so no attendance/employee data was removed.")
-
     return {
-        "status": "deleted", "id": upload_id,
-        "essl_rows_deleted": essl_deleted, "tata_rows_deleted": tata_deleted,
-        "message": message
+        "status": "deleted",
+        "id": upload_id,
+        "file_type": file_type,
+        "essl_rows_deleted": essl_deleted,
+        "tata_rows_deleted": tata_deleted,
+        "employees_deleted": employees_deleted,
+        "derived_data_deleted": derived_deleted,
+        "message": (
+            f"Upload {upload_id} ({file_type}) fully deleted. "
+            f"Raw: {essl_deleted + tata_deleted} rows. "
+            f"Derived: {sum(derived_deleted.values())} rows. "
+            f"Employees deleted: {employees_deleted}."
+        )
     }
 
 
@@ -1798,29 +1854,6 @@ def delete_upload(upload_id: int, db: Session = Depends(get_db)):
 def delete_upload_alias(upload_id: int, db: Session = Depends(get_db)):
     """Alias for /api/v1/upload/{upload_id} — fixes frontend 404s."""
     return delete_upload(upload_id, db)
-
-
-def _clear_derived_data(start: date, end: date, db: Session):
-    """Nuclear option: wipe Attendance, Reconciliation, HRAction, Overtime for a date range.
-    Use this before re-running reconciliation on a month that has stale data."""
-    db.query(Attendance).filter(Attendance.date >= start, Attendance.date < end).delete(synchronize_session=False)
-    db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date >= start, AttendanceReconciliation.date < end).delete(synchronize_session=False)
-    db.query(HRAction).filter(HRAction.date >= start, HRAction.date < end).delete(synchronize_session=False)
-    db.query(Overtime).filter(Overtime.date >= start, Overtime.date < end).delete(synchronize_session=False)
-    db.query(LatePunchPenalty).filter(LatePunchPenalty.month == start.strftime("%Y-%m")).delete(synchronize_session=False)
-    db.query(BehavioralAlert).filter(BehavioralAlert.month == start.strftime("%Y-%m")).delete(synchronize_session=False)
-    db.commit()
-
-
-@app.delete("/api/v1/attendance/clear-month")
-def clear_month_data(month: str = Query(...), db: Session = Depends(get_db)):
-    """Wipe ALL derived reconciliation data for a month. Use before re-running reconciliation
-    if your data looks corrupted or has ghost employees."""
-    year, mon = parse_year_month(month)
-    start = date(year, mon, 1)
-    end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
-    _clear_derived_data(start, end, db)
-    return {"status": "cleared", "month": month, "message": f"All Attendance/Reconciliation/Actions/OT for {month} deleted. Upload fresh ESSL/Tata and re-run reconciliation."}
 
 
 @app.post("/api/v1/upload/master")
@@ -1849,6 +1882,12 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
     emp_by_pr = {e.pr_number: e for e in db.query(Employee).all() if e.pr_number}
     existing_vendor_names = {v.name for v in db.query(Vendor.name).all()}
     existing_store_names = {s.name for s in db.query(Store.name).all()}
+
+    # Create upload log early so we can tag employees with it
+    upload_log = UploadLog(file_type="master", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Processing")
+    db.add(upload_log)
+    db.flush()
+    upload_log_id = upload_log.id
 
     seen_prs = set()
 
@@ -1884,6 +1923,7 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
             emp.wc = category or emp.wc
             emp.status = normalize_employee_status(status_val) if status_val else emp.status
             emp.join_date = parse_date_br(row.get("DOJ", row.get("doj", ""))) or emp.join_date
+            emp.upload_log_id = upload_log_id  # track which master last touched this employee
         else:
             new_emp = Employee(
                 pr_number=pr, bio_id=bio_id, emp_code="", name=name or pr,
@@ -1892,7 +1932,8 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
                 shift="G",
                 wc=category, bc="",
                 status=normalize_employee_status(status_val),
-                join_date=parse_date_br(row.get("DOJ", row.get("doj", "")))
+                join_date=parse_date_br(row.get("DOJ", row.get("doj", ""))),
+                upload_log_id=upload_log_id
             )
             db.add(new_emp)
             emp_by_pr[pr] = new_emp  # so a duplicate PR later in the same file updates, not re-inserts
@@ -1908,14 +1949,15 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
                 emp.status = "INACTIVE"
                 deactivated_count += 1
 
+    upload_log.status = "Success"
+    upload_log.rows_processed = processed
     db.commit()
-    log_result = safe_log_upload(db, "master", file.filename, file_hash, processed, "Success")
     return {
         "status": "success", "type": "master", "rows_processed": processed,
         "vendors_created": vendors_created, "stores_created": stores_created,
         "deactivated_employees": deactivated_count,
         "filename": file.filename,
-        "upload_log": log_result
+        "upload_log_id": upload_log_id
     }
 
 @app.post("/api/v1/upload/essl")
@@ -5534,6 +5576,88 @@ def get_ot_trend_forecast(
 
 
 # ============================================================================
+
+
+# ============================================================================
+# ADMIN / UTILITY ENDPOINTS
+# Use these to fix corrupted states or clean up stale data.
+# ============================================================================
+
+@app.post("/api/v1/admin/purge-inactive-employees")
+def purge_inactive_employees(db: Session = Depends(get_db)):
+    """Permanently delete all employees with status INACTIVE.
+    WARNING: This also removes their historical attendance/reconciliation records
+    via cascade. Only use this if you are sure inactive employees are truly gone."""
+    count = db.query(Employee).filter(Employee.status == "INACTIVE").delete(synchronize_session=False)
+    db.commit()
+    return {"status": "purged", "employees_deleted": count,
+            "message": f"Deleted {count} inactive employees and all their related records."}
+
+@app.post("/api/v1/admin/nuke-derived")
+def nuke_all_derived(
+    month: Optional[str] = Query(None, description="YYYY-MM — wipe only this month. Omit to wipe EVERYTHING derived."),
+    db: Session = Depends(get_db)
+):
+    """NUCLEAR OPTION: Delete ALL derived data (Attendance, Reconciliation, HRAction,
+    Overtime, LatePunchPenalty, BehavioralAlert, MonthlyTataAttendance).
+
+    Use this when your dashboard shows phantom data from deleted uploads.
+    Master employees and raw ESSL/Tata uploads are preserved.
+
+    Pass month=YYYY-MM to limit the wipe to one month.
+    """
+    if month:
+        year, mon = parse_year_month(month)
+        start = date(year, mon, 1)
+        end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+        _clear_derived_data(start, end, db)
+        # Also clear monthly summaries
+        monthly_del = db.query(MonthlyTataAttendance).filter(MonthlyTataAttendance.year_month == month).delete(synchronize_session=False)
+        db.commit()
+        return {
+            "status": "nuked",
+            "scope": month,
+            "message": f"All derived data for {month} has been deleted. Re-upload and reconcile fresh."
+        }
+    else:
+        # Wipe EVERYTHING derived
+        counts = {
+            "attendance": db.query(Attendance).delete(synchronize_session=False),
+            "reconciliation": db.query(AttendanceReconciliation).delete(synchronize_session=False),
+            "hr_actions": db.query(HRAction).delete(synchronize_session=False),
+            "overtime": db.query(Overtime).delete(synchronize_session=False),
+            "late_punch_penalties": db.query(LatePunchPenalty).delete(synchronize_session=False),
+            "behavioral_alerts": db.query(BehavioralAlert).delete(synchronize_session=False),
+            "monthly_tata": db.query(MonthlyTataAttendance).delete(synchronize_session=False),
+        }
+        db.commit()
+        return {
+            "status": "nuked",
+            "scope": "all",
+            "deleted_counts": counts,
+            "message": "All derived data wiped. Uploads and Master employees are preserved. Reconcile fresh."
+        }
+
+@app.get("/api/v1/admin/upload-orphan-check")
+def check_orphan_data(db: Session = Depends(get_db)):
+    """Diagnostic: show how many Attendance/Reconciliation/HRAction/Overtime rows exist
+    that have NO corresponding raw ESSL or Tata row anymore (orphaned by deletes)."""
+    # Find dates where Attendance exists but no ESSL/Tata exists
+    att_dates = db.query(Attendance.date).distinct().all()
+    orphan_dates = []
+    for (d,) in att_dates:
+        has_essl = db.query(ESSLAttendance).filter(ESSLAttendance.date == d).first()
+        has_tata = db.query(TataAttendance).filter(TataAttendance.date == d).first()
+        if not has_essl and not has_tata:
+            count = db.query(Attendance).filter(Attendance.date == d).count()
+            orphan_dates.append({"date": d.isoformat(), "attendance_rows": count})
+
+    return {
+        "orphan_dates_found": len(orphan_dates),
+        "total_orphan_attendance_rows": sum(d["attendance_rows"] for d in orphan_dates),
+        "dates": orphan_dates[:20],  # first 20
+        "recommendation": "Call POST /api/v1/admin/nuke-derived?month=YYYY-MM to clean these up."
+    }
 
 
 # ============================================================================

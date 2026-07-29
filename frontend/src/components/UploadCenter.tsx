@@ -102,7 +102,7 @@ export default function UploadCenter() {
             setLastResult(null);
             let result: UploadResult;
             switch (type) {
-                case 'master': result = await api.uploadMaster(file); break;
+                case 'master': result = await api.uploadMaster(file, true); break;
                 case 'essl': result = await api.uploadESSL(file); break;
                 case 'tata': result = await api.uploadTata(file); break;
                 case 'tata_all': result = await api.uploadTataAll(file); break;
@@ -120,12 +120,12 @@ export default function UploadCenter() {
         }
     };
 
-    const handleDelete = async (id: number, filename: string) => {
+    const handleDelete = async (id: number, filename: string, type: string) => {
         // Destructive action - confirm first. Note: this only removes the log entry
         // (and lets the same file be re-uploaded) - it does not undo the attendance
         // rows that upload created.
         const confirmed = window.confirm(
-            `Remove "${filename}" from upload history?\n\nThis clears it from the history list and allows re-uploading the same file. It does NOT remove the attendance data that was already imported.`
+            `Remove "${filename}" from upload history?\n\nThis will DELETE all raw attendance rows AND all derived data (Attendance, Reconciliation, HR Actions, Overtime) for the dates covered by this upload. For Master files, this DELETES all employees created by that master. This action cannot be undone.`
         );
         if (!confirmed) return;
         try {
@@ -242,7 +242,7 @@ export default function UploadCenter() {
                                     <td className="px-6 py-3 text-slate-500">{new Date(u.uploaded_at).toLocaleString()}</td>
                                     <td className="px-6 py-3 text-right">
                                         <button
-                                            onClick={() => handleDelete(u.id, u.filename)}
+                                            onClick={() => handleDelete(u.id, u.filename, u.type)}
                                             disabled={deletingId === u.id}
                                             title="Remove from history"
                                             className="p-1.5 rounded text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"

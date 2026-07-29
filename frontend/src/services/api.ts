@@ -589,10 +589,10 @@ export const api = {
         });
     },
 
-    uploadMaster: async (file: File, force: boolean = false): Promise<UploadResult> => {
+    uploadMaster: async (file: File, deactivateMissing: boolean = false): Promise<UploadResult> => {
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('force', force.toString());
+        formData.append('deactivate_missing', deactivateMissing.toString());
         return fetchJSON(`${API_BASE}/upload/master`, {
             method: 'POST',
             body: formData
@@ -663,6 +663,7 @@ export const api = {
     // of a generic spinner that looks frozen for a couple minutes.
     runReconciliationMonth: async (
         month: string,
+        clean: boolean = false,
         onProgress?: (stage: string) => void
     ): Promise<{
         status: string; month: string; days_processed: number;
@@ -670,8 +671,9 @@ export const api = {
     }> => {
         const formData = new FormData();
         formData.append('month', month);
+        formData.append('clean', clean.toString());
 
-        const { job_id } = await fetchJSON<{ status: string; job_id: string; month: string }>(
+        const { job_id } = await fetchJSON<{ status: string; job_id: string; month: string; clean: boolean }>(
             `${API_BASE}/reconciliation/run-month`,
             { method: 'POST', body: formData }
         );
@@ -869,5 +871,43 @@ export const api = {
         if (vendor) params.append('vendor', vendor);
         if (store) params.append('store', store);
         return fetchJSON(`${API_BASE}/analytics/ot-trend?${params.toString()}`);
+    },
+
+    // ============================================================================
+    // ADMIN / UTILITY ENDPOINTS
+    // ============================================================================
+
+    nukeDerived: async (month?: string): Promise<{ status: string; scope: string; message: string; deleted_counts?: Record<string, number> }> => {
+        const url = month
+            ? `${API_BASE}/admin/nuke-derived?month=${month}`
+            : `${API_BASE}/admin/nuke-derived`;
+        return fetchJSON(url, { method: 'POST' });
+    },
+
+    purgeInactiveEmployees: async (): Promise<{ status: string; employees_deleted: number; message: string }> => {
+        return fetchJSON(`${API_BASE}/admin/purge-inactive-employees`, { method: 'POST' });
+    },
+
+    checkOrphanData: async (): Promise<{
+        orphan_dates_found: number;
+        total_orphan_attendance_rows: number;
+        dates: Array<{ date: string; attendance_rows: number }>;
+        recommendation: string;
+    }> => {
+        return fetchJSON(`${API_BASE}/admin/upload-orphan-check`);
+    },
+
+    runReconciliationDate: async (targetDate: string, clean: boolean = false): Promise<any> => {
+        const formData = new FormData();
+        formData.append('target_date', targetDate);
+        formData.append('clean', clean.toString());
+        return fetchJSON(`${API_BASE}/reconciliation/run-date`, {
+            method: 'POST',
+            body: formData
+        });
+    },
+
+    clearMonthData: async (month: string): Promise<{ status: string; month: string; message: string }> => {
+        return fetchJSON(`${API_BASE}/attendance/clear-month?month=${month}`, { method: 'DELETE' });
     }
 };
