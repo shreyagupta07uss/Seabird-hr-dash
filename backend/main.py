@@ -1856,6 +1856,29 @@ def delete_upload_alias(upload_id: int, db: Session = Depends(get_db)):
     return delete_upload(upload_id, db)
 
 
+def _clear_derived_data(start: date, end: date, db: Session):
+    """Nuclear option: wipe Attendance, Reconciliation, HRAction, Overtime for a date range.
+    Use this before re-running reconciliation on a month that has stale data."""
+    db.query(Attendance).filter(Attendance.date >= start, Attendance.date < end).delete(synchronize_session=False)
+    db.query(AttendanceReconciliation).filter(AttendanceReconciliation.date >= start, AttendanceReconciliation.date < end).delete(synchronize_session=False)
+    db.query(HRAction).filter(HRAction.date >= start, HRAction.date < end).delete(synchronize_session=False)
+    db.query(Overtime).filter(Overtime.date >= start, Overtime.date < end).delete(synchronize_session=False)
+    db.query(LatePunchPenalty).filter(LatePunchPenalty.month == start.strftime("%Y-%m")).delete(synchronize_session=False)
+    db.query(BehavioralAlert).filter(BehavioralAlert.month == start.strftime("%Y-%m")).delete(synchronize_session=False)
+    db.commit()
+
+
+@app.delete("/api/v1/attendance/clear-month")
+def clear_month_data(month: str = Query(...), db: Session = Depends(get_db)):
+    """Wipe ALL derived reconciliation data for a month. Use before re-running reconciliation
+    if your data looks corrupted or has ghost employees."""
+    year, mon = parse_year_month(month)
+    start = date(year, mon, 1)
+    end = date(year, mon + 1, 1) if mon < 12 else date(year + 1, 1, 1)
+    _clear_derived_data(start, end, db)
+    return {"status": "cleared", "month": month, "message": f"All Attendance/Reconciliation/Actions/OT for {month} deleted. Upload fresh ESSL/Tata and re-run reconciliation."}
+
+
 @app.post("/api/v1/upload/master")
 def upload_master(file: UploadFile = File(...), force: bool = Form(False), deactivate_missing: bool = Form(False), db: Session = Depends(get_db)):
     # NOTE: sync `def` (not async) so Starlette runs this in a worker thread instead of
