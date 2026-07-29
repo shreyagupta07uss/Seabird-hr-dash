@@ -2542,6 +2542,19 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
                 if cell_str in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT"]:
                     row_type = cell_str
                     break
+        # Skip repeating header rows between employee blocks (e.g. "Remarks | 2026-06-01 | 2026-06-02...")
+        if not has_code and row_type in ("REMARKS", "REMARK"):
+            # If any date column contains a full date string, this is a header repeat, not data
+            is_header_repeat = False
+            for col_idx, att_date in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    val_str = str(row[col_idx]).strip()
+                    if re.match(r'\d{4}-\d{2}-\d{2}', val_str) or re.match(r'\d{2}/\d{2}/\d{4}', val_str):
+                        is_header_repeat = True
+                        break
+            if is_header_repeat:
+                continue
+
         if not row_type:
             continue
         target_dict = current_in_row if row_type == "IN" else current_out_row if row_type == "OUT" else current_other_rows.setdefault(row_type, {})
@@ -5029,6 +5042,85 @@ def download_dump_report(
 
             auto_width(summary_ws, summary_headers)
             summary_ws.freeze_panes = "A2"
+
+            # 1.5 Cross-tab sheet (ESSL-style month view)
+            crosstab_ws = wb.create_sheet(title="CrossTab", index=1)
+            all_dates = sorted(records_by_date.keys())
+            crosstab_headers = ["BioID", "PR", "Name", "Days"] + [d.strftime("%d %a") for d in all_dates]
+            crosstab_ws.append(crosstab_headers)
+            for col in range(1, len(crosstab_headers) + 1):
+                cell = crosstab_ws.cell(row=1, column=col)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_align
+                cell.border = thin_border
+
+            # Build lookups from already-fetched records
+            emp_lookup = {}
+            record_lookup = {}
+            for d, recs in records_by_date.items():
+                for r in recs:
+                    record_lookup[(r.pr_number, d)] = r
+                    if r.pr_number not in emp_lookup:
+                        emp_lookup[r.pr_number] = r.employee
+
+            all_prs = sorted(emp_lookup.keys())
+            for pr in all_prs:
+                emp = emp_lookup.get(pr)
+                emp_name = emp.name if emp else pr
+                bio_id = emp.bio_id if emp else ""
+
+                # InTime row
+                in_row = [bio_id, pr, emp_name, "InTime"]
+                for d in all_dates:
+                    r = record_lookup.get((pr, d))
+                    in_row.append(r.final_in or r.essl_in or r.tata_in or "" if r else "")
+                crosstab_ws.append(in_row)
+
+                # OutTime row
+                out_row = [bio_id, pr, emp_name, "OutTime"]
+                for d in all_dates:
+                    r = record_lookup.get((pr, d))
+                    out_row.append(r.final_out or r.essl_out or r.tata_out or "" if r else "")
+                crosstab_ws.append(out_row)
+
+                # Status row
+                status_row = [bio_id, pr, emp_name, "Status"]
+                for d in all_dates:
+                    r = record_lookup.get((pr, d))
+                    status_row.append(r.attendance_status or "" if r else "")
+                crosstab_ws.append(status_row)
+
+                # Total row
+                total_row = [bio_id, pr, emp_name, "Total"]
+                for d in all_dates:
+                    r = record_lookup.get((pr, d))
+                    total_row.append(r.worked_hours if r and r.worked_hours is not None else "")
+                crosstab_ws.append(total_row)
+
+                # OT row
+                ot_row = [bio_id, pr, emp_name, "OT"]
+                for d in all_dates:
+                    r = record_lookup.get((pr, d))
+                    ot_row.append(r.ot_hours if r and r.ot_hours is not None else "")
+                crosstab_ws.append(ot_row)
+
+                # Remark row
+                remark_row = [bio_id, pr, emp_name, "Remark"]
+                for d in all_dates:
+                    r = record_lookup.get((pr, d))
+                    remark_row.append(r.remark or "" if r else "")
+                crosstab_ws.append(remark_row)
+
+            # Style data rows in crosstab
+            for row in crosstab_ws.iter_rows(min_row=2, max_row=crosstab_ws.max_row):
+                for cell in row:
+                    cell.border = thin_border
+                    cell.alignment = left_align
+
+            auto_width(crosstab_ws, crosstab_headers)
+            crosstab_ws.freeze_panes = "E2"
+
 
             # 2. One sheet per date (chronological)
             used_sheet_names = set()
