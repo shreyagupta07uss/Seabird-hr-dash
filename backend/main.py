@@ -2292,49 +2292,203 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
         "all_sheets": sheet_pick["all_sheets"]
     }
 
-def _parse_essl_crosstab_sheet(raw_rows: List[List[Any]]) -> tuple[List[tuple], set, Optional[int]]:
-    """Parse a single ESSL cross-tab sheet. Returns (records, dates, header_row_idx_or_none)."""
-    header_row_idx = None
-    date_columns = []
-    for i, row in enumerate(raw_rows[:15]):
+def _extract_month_from_filename(filename: str) -> Optional[Tuple[int, int]]:
+    """Extract (year, month) from filenames like 'ESSL - July.xlsx', 'ESSL_June_2026.xlsx'."""
+    import calendar
+    month_names = {m.upper(): i for i, m in enumerate(calendar.month_name) if m}
+    month_abbrs = {m.upper(): i for i, m in enumerate(calendar.month_abbr) if m}
+    name = filename.upper()
+    month = None
+    for m_name, m_num in {**month_names, **month_abbrs}.items():
+        if m_name in name:
+            month = m_num
+            break
+    year_match = re.search(r'20\d{2}', name)
+    year = int(year_match.group()) if year_match else datetime.now().year
+    if month:
+        return (year, month)
+    # Try MM-YYYY or YYYY-MM patterns
+    m = re.search(r'(\d{2})[-_](20\d{2})', name)
+    if m:
+        return (int(m.group(2)), int(m.group(1)))
+    m = re.search(r'(20\d{2})[-_](\d{2})', name)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def _parse_day_header(cell_val: Any, year: int, month: int) -> Optional[date]:
+    """Parse headers like '28 T', '29 W', '01 M', '28' into dates."""
+    if cell_val is None:
+        return None
+    s = str(cell_val).strip()
+    m = re.match(r'(\d{1,2})\s*([A-Za-z.]*)', s)
+    if m:
+        day = int(m.group(1))
+        try:
+            return date(year, month, day)
+        except ValueError:
+            pass
+    return None
+
+
+def _find_essl_header_row(raw_rows: List[List[Any]], filename_month: Optional[Tuple[int, int]] = None) -> Optional[Dict[str, Any]]:
+    """Find and analyze the header row. Returns dict with row_idx, date_cols, meta_cols, format_type."""
+    for i, row in enumerate(raw_rows[:50]):
         if len(row) < 3:
             continue
-        dates_in_row = 0
-        for cell in row:
+        # Try full dates first
+        full_dates = []
+        for j, cell in enumerate(row):
             if cell is not None:
-                cell_str = str(cell).strip()
-                if re.match(r'\d{4}-\d{2}-\d{2}', cell_str) or re.match(r'\d{2}/\d{2}/\d{4}', cell_str):
-                    dates_in_row += 1
-        if dates_in_row >= 3:
-            header_row_idx = i
+                parsed = parse_date_br(str(cell).strip())
+                if parsed:
+                    full_dates.append((j, parsed))
+        if len(full_dates) >= 3:
+            return {
+                "row_idx": i,
+                "date_cols": full_dates,
+                "meta_cols": [j for j in range(len(row)) if j not in [d[0] for d in full_dates]],
+                "format_type": "full-dates"
+            }
+        # Try day-number dates if we know month
+        if filename_month:
+            year, month = filename_month
+            day_dates = []
             for j, cell in enumerate(row):
                 if cell is not None:
-                    parsed = parse_date_br(str(cell).strip())
+                    parsed = _parse_day_header(cell, year, month)
                     if parsed:
-                        date_columns.append((j, parsed))
-            break
+                        day_dates.append((j, parsed))
+            if len(day_dates) >= 3:
+                return {
+                    "row_idx": i,
+                    "date_cols": day_dates,
+                    "meta_cols": [j for j in range(len(row)) if j not in [d[0] for d in day_dates]],
+                    "format_type": "day-numbers"
+                }
+    return None
 
-    if header_row_idx is None:
-        return [], set(), None
 
-    header_row = raw_rows[header_row_idx]
-    emp_code_col = emp_name_col = shift_col = None
-    for j, cell in enumerate(header_row):
-        if cell is None:
+def _identify_essl_columns(header_row: List[Any], meta_cols: List[int], raw_rows: List[List[Any]], header_idx: int) -> Dict[str, Any]:
+    """Identify which columns contain employee code, name, and row type."""
+    emp_code_col = None
+    emp_name_col = None
+    row_type_col = None
+
+    # From header text
+    for j in meta_cols:
+        if j >= len(header_row):
             continue
-        cell_str = str(cell).strip().upper()
-        if any(x in cell_str for x in ["EMP CODE", "EMP_CODE", "CODE", "PAYCODE", "PAY CODE", "EMP.CODE"]):
-            emp_code_col = j
-        elif any(x in cell_str for x in ["EMP NAME", "EMP_NAME", "NAME", "EMPLOYEE NAME", "EMPLOYEE_NAME"]):
+        h = str(header_row[j]).strip().upper() if header_row[j] else ""
+        if any(x in h for x in ["EMP CODE", "EMP_CODE", "CODE", "PAYCODE", "PAY CODE", "EMP.CODE", "PR"]):
+            if "NAME" not in h:
+                emp_code_col = j
+        elif any(x in h for x in ["EMP NAME", "EMP_NAME", "NAME", "EMPLOYEE NAME", "EMPLOYEE_NAME"]):
             emp_name_col = j
-        elif cell_str in ["SHIFT", "SFT"]:
-            shift_col = j
+        elif any(x in h for x in ["DAYS", "REMARKS", "REMARK", "SHIFT", "SFT"]):
+            row_type_col = j
 
+    # Fallback: detect from data patterns
     if emp_code_col is None:
-        emp_code_col = 0
-    if emp_name_col is None:
-        emp_name_col = 1
+        for j in meta_cols:
+            codes = 0
+            for r in raw_rows[header_idx+1:header_idx+25]:
+                if j < len(r) and r[j] is not None:
+                    v = str(r[j]).strip()
+                    if re.match(r'^[A-Z0-9\-]+$', v) and len(v) >= 3 and v not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME"]:
+                        codes += 1
+            if codes >= 2:
+                emp_code_col = j
+                break
 
+    if emp_name_col is None and emp_code_col is not None:
+        for j in meta_cols:
+            if j == emp_code_col:
+                continue
+            names = 0
+            for r in raw_rows[header_idx+1:header_idx+25]:
+                if j < len(r) and r[j] is not None:
+                    v = str(r[j]).strip()
+                    if len(v) > 5 and ' ' in v:
+                        names += 1
+            if names >= 2:
+                emp_name_col = j
+                break
+
+    if row_type_col is None:
+        for j in meta_cols:
+            types = 0
+            for r in raw_rows[header_idx+1:header_idx+30]:
+                if j < len(r) and r[j] is not None:
+                    v = str(r[j]).strip().upper()
+                    if v in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME"]:
+                        types += 1
+            if types >= 2:
+                row_type_col = j
+                break
+
+    if row_type_col is None:
+        row_type_col = meta_cols[0] if meta_cols else 0
+
+    return {"emp_code_col": emp_code_col, "emp_name_col": emp_name_col, "row_type_col": row_type_col}
+
+
+def _detect_essl_sub_format(raw_rows: List[List[Any]], header_idx: int, emp_code_col: Optional[int]) -> str:
+    """Detect whether rows have employee codes (A) or use multi-row blocks (B)."""
+    if emp_code_col is None:
+        return "B"
+    with_code = 0
+    without_code = 0
+    for r in raw_rows[header_idx+1:header_idx+40]:
+        if emp_code_col < len(r) and r[emp_code_col] is not None:
+            v = str(r[emp_code_col]).strip()
+            if v and v not in ["", "-", "#N/A", "N/A"] and re.match(r'^[A-Z0-9\-]+$', v) and len(v) >= 3:
+                with_code += 1
+            else:
+                without_code += 1
+        else:
+            without_code += 1
+    return "A" if with_code > without_code * 0.6 else "B"
+
+
+def _parse_essl_sheet(raw_rows: List[List[Any]], sheet_name: str = "",
+                      filename_month: Optional[Tuple[int, int]] = None) -> tuple[List[tuple], set, Dict[str, Any]]:
+    """
+    Universal ESSL sheet parser. Auto-detects format and extracts records.
+    Returns (records, dates, debug_info).
+    """
+    debug = {"sheet_name": sheet_name, "format_detected": None, "rows_scanned": len(raw_rows), "issues": []}
+
+    if not raw_rows or len(raw_rows) < 2:
+        debug["issues"].append("Sheet too small")
+        return [], set(), debug
+
+    # Find header
+    header_info = _find_essl_header_row(raw_rows, filename_month)
+    if header_info is None:
+        debug["issues"].append("No header row with dates found")
+        return [], set(), debug
+
+    header_idx = header_info["row_idx"]
+    date_cols = header_info["date_cols"]
+    meta_cols = header_info["meta_cols"]
+    debug["format_detected"] = header_info["format_type"]
+    debug["header_row"] = header_idx
+    debug["date_columns"] = len(date_cols)
+
+    # Identify columns
+    col_info = _identify_essl_columns(raw_rows[header_idx], meta_cols, raw_rows, header_idx)
+    emp_code_col = col_info["emp_code_col"]
+    emp_name_col = col_info["emp_name_col"]
+    row_type_col = col_info["row_type_col"]
+    debug.update(col_info)
+
+    # Detect sub-format
+    sub_format = _detect_essl_sub_format(raw_rows, header_idx, emp_code_col)
+    debug["sub_format"] = sub_format
+
+    # Parse
     current_emp_code = None
     current_emp_name = ""
     current_shift = "G"
@@ -2344,88 +2498,14 @@ def _parse_essl_crosstab_sheet(raw_rows: List[List[Any]]) -> tuple[List[tuple], 
     all_records = []
     all_dates = set()
 
-    for i in range(header_row_idx + 1, len(raw_rows)):
-        row = raw_rows[i]
-        if len(row) < 3:
-            continue
-        first_val = row[emp_code_col] if emp_code_col < len(row) else None
-        has_code = False
-        if first_val is not None and str(first_val).strip() not in ["", "-", "#N/A", "N/A"]:
-            first_str = str(first_val).strip()
-            if re.match(r'^[A-Z0-9]+$', first_str) and first_str not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT"]:
-                has_code = True
-
-        if has_code:
-            emp_code = str(first_val).strip()
-            if current_emp_code and current_emp_code != emp_code and date_columns:
-                for col_idx, att_date in date_columns:
-                    date_key = att_date.isoformat()
-                    raw_in = current_in_row.get(date_key)
-                    raw_out = current_out_row.get(date_key)
-                    in_time = parse_time_br(raw_in)
-                    out_time = parse_time_br(raw_out)
-                    essl_status = None
-                    if raw_in and raw_in.upper() in ESSL_STATUS_MARKERS:
-                        essl_status = raw_in.upper()
-                    elif raw_out and raw_out.upper() in ESSL_STATUS_MARKERS:
-                        essl_status = raw_out.upper()
-                    raw_punches = {}
-                    for rt, vals in current_other_rows.items():
-                        if date_key in vals:
-                            key = {"TOTAL": "total_hours", "OT": "ot_hours", "STATUS": "status",
-                                   "REMARKS": "remark", "REMARK": "remark", "SHIFT": "shift", "SFT": "shift"}.get(rt, rt.lower())
-                            raw_punches[key] = vals[date_key]
-                    if essl_status:
-                        raw_punches["essl_status"] = essl_status
-                    shift = current_other_rows.get("SHIFT", {}).get(date_key) or current_other_rows.get("SFT", {}).get(date_key) or current_shift
-                    all_records.append((current_emp_code, current_emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches))
-                    all_dates.add(att_date)
-                current_in_row = {}
-                current_out_row = {}
-                current_other_rows = {}
-            current_emp_code = emp_code
-            current_emp_name = str(row[emp_name_col]).strip() if emp_name_col < len(row) and row[emp_name_col] else ""
-            current_shift = "G"
-            if shift_col is not None and shift_col < len(row) and row[shift_col]:
-                current_shift = normalize_shift(str(row[shift_col]).strip())
-        if not current_emp_code:
-            continue
-        row_type = None
-        for j in range(min(10, len(row))):
-            cell = row[j]
-            if cell is not None:
-                cell_str = str(cell).strip().upper()
-                if cell_str in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT"]:
-                    row_type = cell_str
-                    break
-        if not row_type:
-            continue
-        # Skip repeating header rows between employee blocks (e.g. "Remarks | 2026-06-01 | 2026-06-02...")
-        if not has_code and row_type in ("REMARKS", "REMARK"):
-            is_header_repeat = False
-            for col_idx, att_date in date_columns:
-                if col_idx < len(row) and row[col_idx] is not None:
-                    val_str = str(row[col_idx]).strip()
-                    if re.match(r'\d{4}-\d{2}-\d{2}', val_str) or re.match(r'\d{2}/\d{2}/\d{4}', val_str):
-                        is_header_repeat = True
-                        break
-            if is_header_repeat:
-                continue
-        target_dict = current_in_row if row_type == "IN" else current_out_row if row_type == "OUT" else current_other_rows.setdefault(row_type, {})
-        for col_idx, att_date in date_columns:
-            if col_idx >= len(row):
-                continue
-            val = row[col_idx]
-            if val is None or str(val).strip() in ["", "-", "#N/A", "N/A", "NA"]:
-                continue
-            target_dict[att_date.isoformat()] = str(val).strip()
-
-    # Flush last employee
-    if current_emp_code and date_columns:
-        for col_idx, att_date in date_columns:
-            date_key = att_date.isoformat()
-            raw_in = current_in_row.get(date_key)
-            raw_out = current_out_row.get(date_key)
+    def flush_employee():
+        nonlocal current_emp_code, current_in_row, current_out_row, current_other_rows
+        if not current_emp_code or not date_cols:
+            return
+        for col_idx, att_date in date_cols:
+            dk = att_date.isoformat()
+            raw_in = current_in_row.get(dk)
+            raw_out = current_out_row.get(dk)
             in_time = parse_time_br(raw_in)
             out_time = parse_time_br(raw_out)
             essl_status = None
@@ -2435,17 +2515,132 @@ def _parse_essl_crosstab_sheet(raw_rows: List[List[Any]]) -> tuple[List[tuple], 
                 essl_status = raw_out.upper()
             raw_punches = {}
             for rt, vals in current_other_rows.items():
-                if date_key in vals:
+                if dk in vals:
                     key = {"TOTAL": "total_hours", "OT": "ot_hours", "STATUS": "status",
                            "REMARKS": "remark", "REMARK": "remark", "SHIFT": "shift", "SFT": "shift"}.get(rt, rt.lower())
-                    raw_punches[key] = vals[date_key]
+                    raw_punches[key] = vals[dk]
             if essl_status:
                 raw_punches["essl_status"] = essl_status
-            shift = current_other_rows.get("SHIFT", {}).get(date_key) or current_other_rows.get("SFT", {}).get(date_key) or current_shift
-            all_records.append((current_emp_code, current_emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches))
+            shift = current_other_rows.get("SHIFT", {}).get(dk) or current_other_rows.get("SFT", {}).get(dk) or current_shift
+            all_records.append((current_emp_code, current_emp_name, shift, dk, in_time, out_time, essl_status, raw_punches))
             all_dates.add(att_date)
+        current_in_row = {}
+        current_out_row = {}
+        current_other_rows = {}
 
-    return all_records, all_dates, header_row_idx
+    for i in range(header_idx + 1, len(raw_rows)):
+        row = raw_rows[i]
+        if len(row) < 2:
+            continue
+
+        # Extract employee code and name
+        has_emp_code = False
+        emp_code = None
+        emp_name = None
+
+        if emp_code_col is not None and emp_code_col < len(row):
+            val = row[emp_code_col]
+            if val is not None:
+                v = str(val).strip()
+                if v and v not in ["", "-", "#N/A", "N/A"]:
+                    if re.match(r'^[A-Z0-9\-]+$', v) and len(v) >= 3 and v not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME"]:
+                        has_emp_code = True
+                        emp_code = v
+
+        if emp_name_col is not None and emp_name_col < len(row):
+            val = row[emp_name_col]
+            if val is not None:
+                v = str(val).strip()
+                if v and len(v) > 3:
+                    emp_name = v
+
+        # Determine row type
+        row_type = None
+        if row_type_col is not None and row_type_col < len(row) and row[row_type_col] is not None:
+            rt = str(row[row_type_col]).strip().upper()
+            if rt in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME"]:
+                row_type = rt.replace("INTIME", "IN").replace("OUTTIME", "OUT")
+        if not row_type:
+            for j in meta_cols[:5]:
+                if j < len(row) and row[j] is not None:
+                    rt = str(row[j]).strip().upper()
+                    if rt in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME"]:
+                        row_type = rt.replace("INTIME", "IN").replace("OUTTIME", "OUT")
+                        break
+
+        # Skip header-repeat rows
+        if row_type in ("REMARKS", "REMARK") and not has_emp_code:
+            is_repeat = False
+            for col_idx, att_date in date_cols:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    vs = str(row[col_idx]).strip()
+                    if re.match(r'\d{4}-\d{2}-\d{2}', vs) or re.match(r'\d{2}/\d{2}/\d{4}', vs):
+                        is_repeat = True
+                        break
+            if is_repeat:
+                continue
+
+        # --- Sub-format A: every row has employee code ---
+        if sub_format == "A":
+            if not has_emp_code:
+                continue
+            # If new employee, flush previous
+            if current_emp_code and current_emp_code != emp_code:
+                flush_employee()
+            current_emp_code = emp_code
+            if emp_name:
+                current_emp_name = emp_name
+
+            if row_type == "IN":
+                td = current_in_row
+            elif row_type == "OUT":
+                td = current_out_row
+            elif row_type:
+                td = current_other_rows.setdefault(row_type, {})
+            else:
+                continue
+
+            for col_idx, att_date in date_cols:
+                if col_idx >= len(row):
+                    continue
+                val = row[col_idx]
+                if val is None or str(val).strip() in ["", "-", "#N/A", "N/A", "NA"]:
+                    continue
+                td[att_date.isoformat()] = str(val).strip()
+
+        # --- Sub-format B: multi-row blocks ---
+        else:
+            if has_emp_code:
+                if current_emp_code and current_emp_code != emp_code:
+                    flush_employee()
+                current_emp_code = emp_code
+                if emp_name:
+                    current_emp_name = emp_name
+                current_shift = "G"
+                for j in meta_cols:
+                    if j < len(row) and row[j] is not None:
+                        vs = str(row[j]).strip()
+                        if normalize_shift(vs) in VALID_SHIFT_CODES:
+                            current_shift = normalize_shift(vs)
+
+            if not current_emp_code:
+                continue
+            if not row_type:
+                continue
+
+            td = current_in_row if row_type == "IN" else current_out_row if row_type == "OUT" else current_other_rows.setdefault(row_type, {})
+            for col_idx, att_date in date_cols:
+                if col_idx >= len(row):
+                    continue
+                val = row[col_idx]
+                if val is None or str(val).strip() in ["", "-", "#N/A", "N/A", "NA"]:
+                    continue
+                td[att_date.isoformat()] = str(val).strip()
+
+    flush_employee()
+    debug["records_extracted"] = len(all_records)
+    debug["unique_dates"] = len(all_dates)
+    return all_records, all_dates, debug
 
 
 @app.post("/api/v1/upload/essl")
@@ -2459,6 +2654,8 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
         if existing:
             return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
+
+    filename_month = _extract_month_from_filename(file.filename)
 
     try:
         wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
@@ -2491,8 +2688,8 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     sheets_processed = 0
     for ws in wb.worksheets:
         raw_rows = list(ws.iter_rows(values_only=True))
-        sheet_records, sheet_dates, header_idx = _parse_essl_crosstab_sheet(raw_rows)
-        if header_idx is not None:
+        sheet_records, sheet_dates, sheet_debug = _parse_essl_sheet(raw_rows, ws.title, filename_month)
+        if sheet_records:
             all_records.extend(sheet_records)
             all_dates.update(sheet_dates)
             sheets_processed += 1
@@ -2674,6 +2871,92 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
         "status": "success", "type": "essl", "format": "cross-tab", "rows_processed": processed,
         "employees_found": len(set(r[0] for r in all_records)), "date_columns": len(all_dates),
         "sheets_processed": sheets_processed, "elapsed_seconds": elapsed, "filename": file.filename, "upload_log_id": upload_log_id
+    }
+
+
+@app.post("/api/v1/upload/essl/preview")
+def preview_essl(file: UploadFile = File(...)):
+    """
+    Preview what the ESSL parser will extract WITHOUT writing to the database.
+    Shows format detection, sheet-by-sheet breakdown, and sample records.
+    Use this to verify a new ESSL file before committing the upload.
+    """
+    contents = file.file.read()
+    filename_month = _extract_month_from_filename(file.filename)
+
+    try:
+        wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
+
+    sheet_results = []
+    all_records = []
+
+    for ws in wb.worksheets:
+        raw_rows = list(ws.iter_rows(values_only=True))
+        sheet_records, sheet_dates, debug = _parse_essl_sheet(raw_rows, ws.title, filename_month)
+
+        result = {
+            "sheet_name": ws.title,
+            "rows_in_sheet": len(raw_rows),
+            "format_detected": debug.get("format_detected"),
+            "sub_format": debug.get("sub_format"),
+            "header_row": debug.get("header_row"),
+            "date_columns": debug.get("date_columns"),
+            "emp_code_col": debug.get("emp_code_col"),
+            "emp_name_col": debug.get("emp_name_col"),
+            "row_type_col": debug.get("row_type_col"),
+            "records_extracted": debug.get("records_extracted"),
+            "unique_dates": debug.get("unique_dates"),
+            "issues": debug.get("issues", []),
+            "sample_records": []
+        }
+
+        # Add sample records (first 3)
+        for rec in sheet_records[:3]:
+            result["sample_records"].append({
+                "emp_code": rec[0],
+                "emp_name": rec[1],
+                "shift": rec[2],
+                "date": rec[3],
+                "in_time": rec[4],
+                "out_time": rec[5],
+                "status": rec[6]
+            })
+
+        sheet_results.append(result)
+        all_records.extend(sheet_records)
+
+    wb.close()
+
+    # Also try flat format preview
+    flat_preview = []
+    try:
+        flat_rows = read_excel_bytes_to_dicts(contents)
+        for row in flat_rows[:3]:
+            flat_preview.append({
+                "emp_code": str(row.get("EMP Code", row.get("Emp Code", row.get("emp_code", "")))),
+                "emp_name": str(row.get("EMP Name", row.get("Emp Name", row.get("name", "")))),
+                "date": str(row.get("Date", row.get("date", ""))),
+                "in_time": str(row.get("IN", row.get("In", row.get("in_time", "")))),
+                "out_time": str(row.get("OUT", row.get("Out", row.get("out_time", ""))))
+            })
+    except:
+        pass
+
+    return {
+        "filename": file.filename,
+        "filename_month_inferred": f"{filename_month[0]}-{filename_month[1]:02d}" if filename_month else None,
+        "total_sheets": len(sheet_results),
+        "sheets_with_data": sum(1 for s in sheet_results if s["records_extracted"] > 0),
+        "total_records_across_sheets": len(all_records),
+        "sheets": sheet_results,
+        "flat_format_preview": flat_preview if flat_preview else None,
+        "recommendation": (
+            "Cross-tab format detected — upload will work." 
+            if any(s["records_extracted"] > 0 for s in sheet_results)
+            else "No cross-tab data detected. The file may be in flat format or use an unsupported layout. Check flat_format_preview."
+        )
     }
 
 @app.post("/api/v1/upload/tata")
@@ -2960,6 +3243,8 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
         existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
         if existing:
             return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
+
+    filename_month = _extract_month_from_filename(file.filename)
 
     try:
         wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
