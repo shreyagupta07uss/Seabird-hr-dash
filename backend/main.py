@@ -5620,17 +5620,29 @@ def purge_inactive_employees(db: Session = Depends(get_db)):
 def nuke_all_employees(db: Session = Depends(get_db)):
     """NUCLEAR OPTION: Delete ALL employees from the database.
 
-    Use this when you want a completely fresh start. All employee records,
-    their attendance, reconciliation, actions, and overtime history will be gone.
-    Uploads and vendors/stores are preserved.
+    First clears ALL derived data (attendance, reconciliation, actions, OT, penalties,
+    alerts, monthly summaries) to remove foreign key references, then deletes all
+    employees. Uploads and vendors/stores are preserved.
 
     WARNING: This cannot be undone."""
+    # Step 1: Clear ALL derived tables that reference employees via FK
+    db.query(Attendance).delete(synchronize_session=False)
+    db.query(AttendanceReconciliation).delete(synchronize_session=False)
+    db.query(HRAction).delete(synchronize_session=False)
+    db.query(Overtime).delete(synchronize_session=False)
+    db.query(LatePunchPenalty).delete(synchronize_session=False)
+    db.query(BehavioralAlert).delete(synchronize_session=False)
+    db.query(MonthlyTataAttendance).delete(synchronize_session=False)
+    db.commit()
+
+    # Step 2: Now safe to delete all employees (no FK references left)
     count = db.query(Employee).delete(synchronize_session=False)
     db.commit()
+
     return {
         "status": "nuked",
         "employees_deleted": count,
-        "message": f"Deleted ALL {count} employees. Upload a fresh Master to rebuild the roster."
+        "message": f"Deleted ALL {count} employees and all their derived data. Upload a fresh Master to rebuild the roster."
     }
 
 @app.post("/api/v1/admin/nuke-derived")
