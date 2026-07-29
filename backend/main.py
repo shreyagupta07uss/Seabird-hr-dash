@@ -1784,20 +1784,50 @@ def delete_upload(upload_id: int, db: Session = Depends(get_db)):
     tata_deleted = 0
     derived_deleted = {"attendance": 0, "reconciliation": 0, "hr_actions": 0, "overtime": 0}
     employees_deleted = 0
+    purge_counts = None
 
     if file_type == "master":
-        # FIX: hard-DELETEing these employees crashes with a Postgres
-        # IntegrityError (foreign key violation) the moment any of them has
-        # attendance/reconciliation/overtime history, since employee_id on
-        # those tables references employees.id and nothing cleans those rows
-        # up first. That's what was producing the unexplained HTTP 500 here.
-        # Soft-delete instead: mark them INACTIVE. This is also just correct
-        # behavior - undoing a master upload shouldn't destroy attendance
-        # history that's already been reconciled against those employee IDs.
-        employees_deleted = db.query(Employee).filter(
-            Employee.upload_log_id == upload_id
-        ).update({"status": "INACTIVE"}, synchronize_session=False)
+        # FULL PURGE, as requested: completely remove every employee this specific
+        # upload CREATED (upload_log_id is only set at creation time now, never on
+        # update - see upload_master), plus every row anywhere in the schema that
+        # references them, so nothing is left behind. This is deliberately scoped to
+        # employees this upload *created*, not ones it merely updated - employees
+        # that already existed belong to whichever earlier upload created them, and
+        # purging them here would incorrectly destroy data unrelated to this upload.
+        #
+        # NOTE: this is irreversible - it also removes their attendance/reconciliation/
+        # OT history, not just the employee record. Deletes children before parents
+        # to satisfy FK constraints (employee_id -> employees.id on ESSL/Tata/
+        # Attendance/Overtime), and cleans up pr_number-keyed tables that have no
+        # employee_id FK at all (AttendanceReconciliation, HRAction, MonthlyTataAttendance).
+        purge_employees = db.query(Employee).filter(Employee.upload_log_id == upload_id).all()
+        purge_ids = [e.id for e in purge_employees]
+        purge_prs = [e.pr_number for e in purge_employees]
+        purge_counts = {
+            "employees": 0, "essl": 0, "tata": 0, "overtime": 0,
+            "attendance": 0, "reconciliation": 0, "hr_actions": 0, "monthly_tata": 0
+        }
+        if purge_ids:
+            purge_counts["essl"] = db.query(ESSLAttendance).filter(
+                ESSLAttendance.employee_id.in_(purge_ids)).delete(synchronize_session=False)
+            purge_counts["tata"] = db.query(TataAttendance).filter(
+                TataAttendance.employee_id.in_(purge_ids)).delete(synchronize_session=False)
+            purge_counts["overtime"] = db.query(Overtime).filter(
+                Overtime.employee_id.in_(purge_ids)).delete(synchronize_session=False)
+            purge_counts["attendance"] = db.query(Attendance).filter(
+                Attendance.employee_id.in_(purge_ids)).delete(synchronize_session=False)
+        if purge_prs:
+            purge_counts["reconciliation"] = db.query(AttendanceReconciliation).filter(
+                AttendanceReconciliation.pr_number.in_(purge_prs)).delete(synchronize_session=False)
+            purge_counts["hr_actions"] = db.query(HRAction).filter(
+                HRAction.pr_number.in_(purge_prs)).delete(synchronize_session=False)
+            purge_counts["monthly_tata"] = db.query(MonthlyTataAttendance).filter(
+                MonthlyTataAttendance.pr_number.in_(purge_prs)).delete(synchronize_session=False)
+        if purge_ids:
+            purge_counts["employees"] = db.query(Employee).filter(
+                Employee.id.in_(purge_ids)).delete(synchronize_session=False)
         db.commit()
+        employees_deleted = purge_counts["employees"]
 
     elif file_type in ("essl", "tata", "daywise"):
         # Find the date range this upload covered
@@ -1884,11 +1914,21 @@ def delete_upload(upload_id: int, db: Session = Depends(get_db)):
         "status": "deleted",
         "id": upload_id,
         "file_type": file_type,
-        "essl_rows_deleted": essl_deleted,
-        "tata_rows_deleted": tata_deleted,
+        "essl_rows_deleted": essl_deleted if purge_counts is None else purge_counts["essl"],
+        "tata_rows_deleted": tata_deleted if purge_counts is None else purge_counts["tata"],
         "employees_deleted": employees_deleted,
-        "derived_data_deleted": derived_deleted,
+        "derived_data_deleted": derived_deleted if purge_counts is None else {
+            "attendance": purge_counts["attendance"],
+            "reconciliation": purge_counts["reconciliation"],
+            "hr_actions": purge_counts["hr_actions"],
+            "overtime": purge_counts["overtime"],
+            "monthly_tata": purge_counts["monthly_tata"],
+        },
         "message": (
+            f"Upload {upload_id} ({file_type}) fully purged - nothing left. "
+            f"{employees_deleted} employee(s) this upload created, plus every "
+            f"attendance/reconciliation/OT/HR-action row tied to them, all removed."
+        ) if purge_counts is not None else (
             f"Upload {upload_id} ({file_type}) fully deleted. "
             f"Raw: {essl_deleted + tata_deleted} rows. "
             f"Derived: {sum(derived_deleted.values())} rows. "
@@ -2022,8 +2062,72 @@ def clear_month_raw_data(month: str = Query(...), db: Session = Depends(get_db))
     }
 
 
+def _pick_master_sheet(file_bytes: bytes, sheet_name_override: Optional[str] = None) -> Dict[str, Any]:
+    """FIX: upload_master used to always read worksheet index 0. Real master files
+    from this company routinely have multiple sheets (e.g. 'Left in June', 'UPDATED',
+    'Gate Pass', old working sheets) where sheet 0 is NOT the actual roster - it read
+    a 67-row 'employees who left' sheet instead of the 1,199-row 'UPDATED' master.
+    This picks the right sheet automatically:
+      1. If sheet_name_override is given, use exactly that sheet.
+      2. Else, if a sheet literally named 'UPDATED' exists (case-insensitive), use it -
+         that naming is this company's convention for "this is the current roster".
+      3. Else, among sheets whose header row contains 'PR' AND ('Name' or 'Vendor'),
+         pick whichever has the most non-empty data rows (the real roster is virtually
+         always the biggest sheet with those columns - old/left/gate-pass sheets are
+         smaller subsets).
+      4. Else fall back to sheet index 0 (old behavior) so nothing silently breaks
+         on a single-sheet file.
+    Always returns sheet_info listing every sheet's row count, so even a wrong
+    auto-pick is immediately visible in the API response instead of a silent undercount.
+    """
+    wb = load_workbook(filename=bio.BytesIO(file_bytes), read_only=True, data_only=True)
+    sheet_info = []
+    candidates = []  # (name, non_empty_row_count, worksheet_index)
+    for idx, ws in enumerate(wb.worksheets):
+        rows = list(ws.iter_rows(values_only=True))
+        non_empty = sum(1 for r in rows[1:] if any(v is not None for v in r)) if rows else 0
+        headers = [str(h).strip() if h is not None else "" for h in rows[0]] if rows else []
+        sheet_info.append({"name": ws.title, "data_rows": non_empty})
+        has_pr = any(h.upper() == "PR" or "PR NUMBER" in h.upper() for h in headers)
+        has_name_or_vendor = any(h.upper() in ("NAME", "EMP NAME", "EMPLOYEE NAME", "VENDOR") for h in headers)
+        if has_pr and has_name_or_vendor:
+            candidates.append((ws.title, non_empty, idx))
+    wb.close()
+
+    chosen_name = None
+    chosen_idx = 0
+    if sheet_name_override:
+        for name, _, idx in candidates or [(s["name"], s["data_rows"], i) for i, s in enumerate(sheet_info)]:
+            if name.strip().lower() == sheet_name_override.strip().lower():
+                chosen_name, chosen_idx = name, idx
+                break
+        if chosen_name is None:
+            raise ValueError(f"Sheet '{sheet_name_override}' not found. Available sheets: "
+                              f"{[s['name'] for s in sheet_info]}")
+    elif any(s["name"].strip().upper() == "UPDATED" for s in sheet_info):
+        for i, s in enumerate(sheet_info):
+            if s["name"].strip().upper() == "UPDATED":
+                chosen_name, chosen_idx = s["name"], i
+                break
+    elif candidates:
+        candidates.sort(key=lambda c: c[1], reverse=True)
+        chosen_name, _, chosen_idx = candidates[0]
+    else:
+        chosen_name = sheet_info[0]["name"] if sheet_info else None
+
+    return {"sheet_index": chosen_idx, "sheet_name": chosen_name, "all_sheets": sheet_info}
+
+
+@app.post("/api/v1/upload/master/sheets")
+def preview_master_sheets(file: UploadFile = File(...)):
+    """Lets the frontend show a sheet picker before committing to an upload -
+    returns every sheet name + row count + which one would be auto-selected."""
+    contents = file.file.read()
+    return _pick_master_sheet(contents)
+
+
 @app.post("/api/v1/upload/master")
-def upload_master(file: UploadFile = File(...), force: bool = Form(False), deactivate_missing: bool = Form(False), db: Session = Depends(get_db)):
+def upload_master(file: UploadFile = File(...), force: bool = Form(False), deactivate_missing: bool = Form(False), sheet_name: Optional[str] = Form(None), db: Session = Depends(get_db)):
     # NOTE: sync `def` (not async) so Starlette runs this in a worker thread instead of
     # blocking the single event loop for the whole upload - fixes ERR_HTTP2_PING_FAILED /
     # "CORS" errors on large files, since the server can still answer keepalive pings.
@@ -2034,7 +2138,8 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
         if existing:
             return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
     try:
-        rows = read_excel_bytes_to_dicts(contents)
+        sheet_pick = _pick_master_sheet(contents, sheet_name_override=sheet_name)
+        rows = read_excel_bytes_to_dicts(contents, sheet_index=sheet_pick["sheet_index"])
     except Exception as e:
         db.add(UploadLog(file_type="master", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
         db.commit()
@@ -2089,7 +2194,11 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
             emp.wc = category or emp.wc
             emp.status = normalize_employee_status(status_val) if status_val else emp.status
             emp.join_date = parse_date_br(row.get("DOJ", row.get("doj", ""))) or emp.join_date
-            emp.upload_log_id = upload_log_id  # track which master last touched this employee
+            # FIX: do NOT overwrite upload_log_id on update - it must stay pointing
+            # at whichever upload originally CREATED this employee, so a later
+            # master purge-delete only removes employees this upload actually
+            # introduced, not every employee it happened to touch (which would
+            # incorrectly rope in employees that belong to earlier uploads).
         else:
             new_emp = Employee(
                 pr_number=pr, bio_id=bio_id, emp_code="", name=name or pr,
@@ -2123,7 +2232,9 @@ def upload_master(file: UploadFile = File(...), force: bool = Form(False), deact
         "vendors_created": vendors_created, "stores_created": stores_created,
         "deactivated_employees": deactivated_count,
         "filename": file.filename,
-        "upload_log_id": upload_log_id
+        "upload_log_id": upload_log_id,
+        "sheet_used": sheet_pick["sheet_name"],
+        "all_sheets": sheet_pick["all_sheets"]
     }
 
 @app.post("/api/v1/upload/essl")
