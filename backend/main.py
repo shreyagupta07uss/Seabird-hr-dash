@@ -5620,48 +5620,73 @@ def purge_inactive_employees(db: Session = Depends(get_db)):
 def nuke_all_employees(db: Session = Depends(get_db)):
     """NUCLEAR OPTION: Delete ALL employees from the database.
 
-    Uses raw SQL TRUNCATE with CASCADE to bypass FK constraints.
+    Deletes child tables first (to avoid FK violations), then employees.
     Uploads and vendors/stores are preserved.
 
     WARNING: This cannot be undone."""
-    from sqlalchemy import text
-
-    # Step 1: TRUNCATE all derived tables with CASCADE (PostgreSQL) 
-    # This is faster than DELETE and handles FK constraints automatically
-    tables = [
-        "attendance", "attendance_reconciliation", "hr_actions", 
-        "overtime", "late_punch_penalties", "behavioral_alerts", 
-        "monthly_tata_attendance"
-    ]
-    for table in tables:
-        try:
-            db.execute(text(f'TRUNCATE TABLE {table} CASCADE'))
-        except Exception:
-            # If TRUNCATE fails (e.g. SQLite), fall back to DELETE
-            pass
-    db.commit()
-
-    # Step 2: Also try DELETE as fallback for SQLite
     try:
+        # Delete in dependency order: child tables first
         db.query(Attendance).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
         db.query(AttendanceReconciliation).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
         db.query(HRAction).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
         db.query(Overtime).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
         db.query(LatePunchPenalty).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
         db.query(BehavioralAlert).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
         db.query(MonthlyTataAttendance).delete(synchronize_session=False)
         db.commit()
     except Exception:
         db.rollback()
 
-    # Step 3: Delete all employees
+    try:
+        db.query(ESSLAttendance).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
+        db.query(TataAttendance).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    # Now safe to delete employees
     count = db.query(Employee).delete(synchronize_session=False)
     db.commit()
 
     return {
         "status": "nuked",
         "employees_deleted": count,
-        "message": f"Deleted ALL {count} employees and all their derived data. Upload a fresh Master to rebuild the roster."
+        "message": f"Deleted ALL {count} employees and all their data. Upload a fresh Master to rebuild the roster."
     }
 
 @app.post("/api/v1/admin/nuke-derived")
