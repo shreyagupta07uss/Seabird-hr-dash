@@ -201,6 +201,9 @@ export interface UploadResult {
     date?: string;
     essl_rows_processed?: number;
     tata_rows_processed?: number;
+    dates_covered?: number;
+    date_range?: string;
+    employees_matched?: number;
     sheets_found?: {
         essl_in: boolean;
         essl_out: boolean;
@@ -647,12 +650,35 @@ export const api = {
         });
     },
 
+    uploadTataDaily: async (file: File, targetDate?: string, force: boolean = false): Promise<UploadResult> => {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('force', force.toString());
+        if (targetDate) formData.append('target_date', targetDate);
+        return fetchJSON(`${API_BASE}/upload/tata-daily`, {
+            method: 'POST',
+            body: formData
+        });
+    },
+
     uploadDaywise: async (file: File, targetDate?: string, force: boolean = false): Promise<UploadResult> => {
         const formData = new FormData();
         formData.append('file', file);
         formData.append('force', force.toString());
         if (targetDate) formData.append('target_date', targetDate);
         return fetchJSON(`${API_BASE}/upload/daywise`, {
+            method: 'POST',
+            body: formData,
+            timeout: 600000,
+        });
+    },
+
+    uploadEsslDaywise: async (file: File, targetDate?: string, force: boolean = false): Promise<UploadResult> => {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('force', force.toString());
+        if (targetDate) formData.append('target_date', targetDate);
+        return fetchJSON(`${API_BASE}/upload/essl-daywise`, {
             method: 'POST',
             body: formData,
             timeout: 600000,

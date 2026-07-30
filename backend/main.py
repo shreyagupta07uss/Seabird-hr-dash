@@ -3345,6 +3345,169 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
             "filename": file.filename, "message": "Official attendance stored. Ready for reconciliation.",
             "upload_log_id": upload_log_id}
 
+
+@app.post("/api/v1/upload/tata-daily")
+def upload_tata_daily(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
+    """Single-sheet daily Tata upload — optimized for one-day exports like '28th TATA'.
+    Pass target_date (DD/MM/YYYY or YYYY-MM-DD) to override the Date column if missing/unreliable."""
+    import time as time_module
+    start_time = time_module.time()
+
+    contents = file.file.read()
+    file_hash = hashlib.sha256(contents).hexdigest()
+    if not force:
+        existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
+        if existing:
+            return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
+
+    try:
+        rows = read_excel_bytes_to_dicts(contents, sheet_index=0)
+    except Exception as e:
+        db.add(UploadLog(file_type="tata_daily", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
+        db.commit()
+        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
+
+    # Prefetch employees once
+    all_employees = db.query(Employee).all()
+    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
+    emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
+    emp_by_name = _build_unique_name_index(all_employees)
+
+    def resolve_employee_fast(paycode: str, emp_name_val: str):
+        e = emp_by_pr.get(paycode)
+        if e:
+            return e
+        e = emp_by_code.get(paycode)
+        if e:
+            return e
+        if emp_name_val:
+            return emp_by_name.get(emp_name_val.strip().upper())
+        return None
+
+    # Parse rows in memory
+    parsed = []
+    all_dates = set()
+    for row in rows:
+        paycode = str(row.get("PayCode", row.get("Pay Code", row.get("paycode", "")))).strip()
+        att_date = parse_date_br(row.get("Date", row.get("date", "")))
+        if not paycode:
+            continue
+        # If target_date is provided and row date is missing/unparseable, use target_date
+        if not att_date and target_date:
+            att_date = parse_date_br(target_date)
+        if not att_date:
+            continue
+        parsed.append({
+            "paycode": paycode,
+            "emp_name": str(row.get("Employee Name", row.get("EMP Name", row.get("EmployeeName", "")))).strip(),
+            "att_date": att_date,
+            "in_time": safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", ""))))),
+            "out_time": safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", ""))))),
+            "man_hrs": float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0),
+            "status_val": str(row.get("Status", row.get("status", "P"))).strip().upper(),
+            "dept_from_row": str(row.get("Department", row.get("department", ""))).strip(),
+            "division_from_row": str(row.get("Division", "")).strip(),
+            "row_shift_raw": row.get("Shift", row.get("Shift In Time", None)),
+            "category_raw": str(row.get("WC/BC", "")).strip(),
+            "contractor_raw": str(row.get("Contractor", "")).strip(),
+            "store_raw": str(row.get("Store", "")).strip(),
+            "early_going": str(row.get("Early Going", "")).strip(),
+            "shift_late": str(row.get("Shift Late", "")).strip(),
+        })
+        all_dates.add(att_date)
+
+    if not parsed:
+        raise HTTPException(status_code=400, detail="No valid rows found in the file. Expected columns: PayCode, Employee Name, Date, In Time, Out Time, Man Hrs, Status, Shift, Department, Division, WC/BC, Contractor, Store")
+
+    # Bulk-fetch existing TataAttendance rows for the date range touched
+    existing_map = {}
+    if parsed:
+        min_date, max_date = min(all_dates), max(all_dates)
+        for rec in db.query(TataAttendance).filter(TataAttendance.date >= min_date, TataAttendance.date <= max_date).all():
+            existing_map[(rec.pr_number, rec.date)] = rec
+
+    processed = 0
+    pending_inserts = {}
+
+    upload_log = UploadLog(file_type="tata_daily", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Processing")
+    db.add(upload_log)
+    db.flush()
+    upload_log_id = upload_log.id
+
+    for item in parsed:
+        paycode = item["paycode"]; att_date = item["att_date"]
+        in_time = item["in_time"]; out_time = item["out_time"]; man_hrs = item["man_hrs"]
+        status_val = item["status_val"]; dept_from_row = item["dept_from_row"]; division_from_row = item["division_from_row"]
+
+        emp = resolve_employee_fast(paycode, item["emp_name"])
+        pr_number = emp.pr_number if emp else paycode
+
+        if item["row_shift_raw"]:
+            shift = safe_shift(str(item["row_shift_raw"]))
+        else:
+            shift = emp.shift if emp else "G"
+
+        category = normalize_category(item["category_raw"]).strip() or (emp.wc if emp else "BC")
+        if category == "":
+            category = emp.wc if emp else "BC"
+
+        if emp:
+            dept_val = dept_from_row or division_from_row
+            if dept_val and emp.department != dept_val:
+                emp.department = dept_val
+
+        if status_val not in ["P", "A", "L", "HD", "WO", "SP"]:
+            status_val = "P" if (in_time or out_time or man_hrs > 0) else "A"
+
+        ot_result = calculate_ot(shift, category, in_time, out_time, man_hrs)
+        key = (pr_number, att_date)
+        existing_tata = existing_map.get(key)
+
+        if existing_tata:
+            existing_tata.in_time = safe_time(in_time) or existing_tata.in_time
+            existing_tata.out_time = safe_time(out_time) or existing_tata.out_time
+            existing_tata.man_hrs = man_hrs if man_hrs > 0 else existing_tata.man_hrs
+            existing_tata.status = status_val
+            existing_tata.ot_hours = ot_result["calculated_ot_hours"]
+            existing_tata.shift = safe_shift(shift)
+            existing_tata.department = dept_from_row or division_from_row or existing_tata.department
+            existing_tata.upload_log_id = upload_log_id
+        elif key in pending_inserts:
+            pend = pending_inserts[key]
+            pend["in_time"] = safe_time(in_time) or pend["in_time"]
+            pend["out_time"] = safe_time(out_time) or pend["out_time"]
+            pend["man_hrs"] = man_hrs if man_hrs > 0 else pend["man_hrs"]
+            pend["status"] = status_val
+            pend["ot_hours"] = ot_result["calculated_ot_hours"]
+            pend["shift"] = safe_shift(shift)
+            pend["department"] = dept_from_row or division_from_row or pend["department"]
+        else:
+            pending_inserts[key] = dict(
+                employee_id=emp.id if emp else None, pr_number=pr_number, emp_code=paycode, emp_name=item["emp_name"],
+                date=att_date, in_time=safe_time(in_time), out_time=safe_time(out_time), man_hrs=man_hrs, status=status_val,
+                ot_hours=ot_result["calculated_ot_hours"],
+                early_going=item["early_going"], shift_late=item["shift_late"],
+                vendor=normalize_vendor(item["contractor_raw"] or (emp.vendor if emp else "")),
+                store=item["store_raw"] or (emp.store if emp else ""),
+                department=dept_from_row or division_from_row or (emp.department if emp else ""),
+                shift=safe_shift(shift),
+                upload_log_id=upload_log_id
+            )
+        processed += 1
+
+    if pending_inserts:
+        db.execute(TataAttendance.__table__.insert(), list(pending_inserts.values()))
+
+    upload_log.status = "Success"
+    upload_log.rows_processed = processed
+    db.commit()
+    elapsed = round(time_module.time() - start_time, 2)
+    return {"status": "success", "type": "tata_daily", "rows_processed": processed,
+            "dates_covered": len(all_dates), "date_range": f"{min(all_dates).isoformat()} to {max(all_dates).isoformat()}",
+            "elapsed_seconds": elapsed, "filename": file.filename,
+            "message": "Daily Tata attendance stored. Ready for reconciliation.",
+            "upload_log_id": upload_log_id}
+
 @app.post("/api/v1/upload/tata-all")
 def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
     contents = file.file.read()
@@ -3667,6 +3830,161 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
         "essl_rows_processed": essl_processed, "tata_rows_processed": tata_processed,
         "filename": file.filename,
         "message": f"Day-wise attendance stored for {resolved_date.isoformat()}. Run reconciliation for this date next.",
+        "upload_log_id": upload_log_id
+    }
+
+
+
+def _extract_date_from_essl_daywise_sheet(ws, filename_month=None):
+    """Extract the date from the last header cell of an ESSL daywise side-sheet.
+    Typical header row: Bio | PRN | Name | Days | 28 T"""
+    if ws is None:
+        return None
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows or not rows[0]:
+        return None
+    last_header = rows[0][-1]
+    if last_header is None:
+        return None
+    s = str(last_header).strip()
+    # Try full date first
+    parsed = parse_date_br(s)
+    if parsed:
+        return parsed
+    # Try day-number format (e.g. '28 T')
+    if filename_month:
+        parsed = _parse_day_header(s, filename_month[0], filename_month[1])
+        if parsed:
+            return parsed
+    # Fallback to current year/month
+    now = datetime.now()
+    parsed = _parse_day_header(s, now.year, now.month)
+    return parsed
+
+
+@app.post("/api/v1/upload/essl-daywise")
+def upload_essl_daywise(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
+    """Single-day ESSL-only upload: one workbook with 'Essl In' and/or 'Essl Out' sheets.
+    This is the raw export format from the ESSL portal. Parses IN/OUT times and status
+    markers (WO, A, L, P, SP, HD) and upserts into ESSLAttendance for the detected date.
+    Pass target_date (DD/MM/YYYY or YYYY-MM-DD) to override auto-detection."""
+    contents = file.file.read()
+    file_hash = hashlib.sha256(contents).hexdigest()
+    if not force:
+        existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
+        if existing:
+            return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
+
+    try:
+        wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
+    except Exception as e:
+        db.add(UploadLog(file_type="essl_daywise", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
+        db.commit()
+        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
+
+    essl_in_ws = _find_sheet_by_keywords(wb, ["essl", "in"], must_not_contain=["out"])
+    essl_out_ws = _find_sheet_by_keywords(wb, ["essl", "out"])
+
+    if essl_in_ws is None and essl_out_ws is None:
+        wb.close()
+        raise HTTPException(status_code=400, detail="Couldn't find 'Essl In' or 'Essl Out' sheets. Expected at least one (case/spacing doesn't matter).")
+
+    filename_month = _extract_month_from_filename(file.filename)
+    resolved_date = parse_date_br(target_date) if target_date else None
+
+    if resolved_date is None:
+        for ws in [essl_in_ws, essl_out_ws]:
+            resolved_date = _extract_date_from_essl_daywise_sheet(ws, filename_month)
+            if resolved_date:
+                break
+
+    if resolved_date is None:
+        wb.close()
+        raise HTTPException(status_code=400, detail="Couldn't determine the attendance date. Pass target_date explicitly (DD/MM/YYYY or YYYY-MM-DD).")
+
+    in_data = _parse_essl_side_sheet(essl_in_ws) if essl_in_ws is not None else {}
+    out_data = _parse_essl_side_sheet(essl_out_ws) if essl_out_ws is not None else {}
+
+    all_employees = db.query(Employee).all()
+    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
+    emp_by_name = _build_unique_name_index(all_employees)
+
+    def resolve_emp(code_val, name_val):
+        if code_val and code_val in emp_by_pr:
+            return emp_by_pr[code_val]
+        if name_val and name_val.strip().upper() in emp_by_name:
+            return emp_by_name[name_val.strip().upper()]
+        return None
+
+    upload_log = UploadLog(file_type="essl_daywise", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Processing")
+    db.add(upload_log)
+    db.flush()
+    upload_log_id = upload_log.id
+
+    all_prns = set(in_data.keys()) | set(out_data.keys())
+    processed = 0
+    matched = 0
+
+    for prn in all_prns:
+        in_rec = in_data.get(prn, {})
+        out_rec = out_data.get(prn, {})
+        name_val = in_rec.get("name") or out_rec.get("name") or ""
+        in_time = in_rec.get("time")
+        out_time = out_rec.get("time")
+        essl_status = in_rec.get("status") or out_rec.get("status")
+
+        emp = resolve_emp(prn, name_val)
+
+        existing_essl = db.query(ESSLAttendance).filter(
+            ESSLAttendance.pr_number == prn,
+            ESSLAttendance.date == resolved_date
+        ).first()
+
+        if existing_essl:
+            existing_essl.in_time = safe_time(in_time) or existing_essl.in_time
+            existing_essl.out_time = safe_time(out_time) or existing_essl.out_time
+            existing_essl.status = essl_status or existing_essl.status
+            existing_essl.upload_log_id = upload_log_id
+        else:
+            db.add(ESSLAttendance(
+                employee_id=emp.id if emp else None,
+                pr_number=prn,
+                emp_code=prn,
+                emp_name=name_val,
+                date=resolved_date,
+                in_time=safe_time(in_time),
+                out_time=safe_time(out_time),
+                status=essl_status,
+                vendor=emp.vendor if emp else "",
+                store=emp.store if emp else "",
+                shift=safe_shift(emp.shift) if emp else "G",
+                upload_log_id=upload_log_id
+            ))
+        processed += 1
+        if emp:
+            matched += 1
+        if processed % 500 == 0:
+            db.commit()
+
+    db.commit()
+    try:
+        wb.close()
+    except Exception:
+        pass
+
+    upload_log.status = "Success"
+    upload_log.rows_processed = processed
+    db.commit()
+
+    return {
+        "status": "success",
+        "type": "essl_daywise",
+        "date": resolved_date.isoformat(),
+        "sheets_found": {"essl_in": essl_in_ws is not None, "essl_out": essl_out_ws is not None},
+        "rows_processed": processed,
+        "employees_matched": matched,
+        "filename": file.filename,
+        "message": f"ESSL day-wise attendance stored for {resolved_date.isoformat()}. Run reconciliation for this date next.",
         "upload_log_id": upload_log_id
     }
 

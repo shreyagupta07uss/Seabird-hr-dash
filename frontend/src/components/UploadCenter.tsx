@@ -110,6 +110,8 @@ export default function UploadCenter() {
                 // New: single workbook with 'Essl In' / 'Essl Out' / 'Tata' sheets for one day.
                 // The backend auto-detects the date from the Tata sheet, so no extra input needed here.
                 case 'daywise': result = await api.uploadDaywise(file); break;
+                case 'tata_daily': result = await api.uploadTataDaily(file); break;
+                case 'essl_daywise': result = await api.uploadEsslDaywise(file); break;
                 default: throw new Error(`Unknown upload type: ${type}`);
             }
             setLastResult(result);
@@ -165,9 +167,11 @@ export default function UploadCenter() {
 
     const uploadZones = [
         { type: 'daywise', title: 'Day-wise (ESSL + Tata)', description: "One day's combined workbook - 'Essl In', 'Essl Out', and 'Tata' sheets in a single file. Date is auto-detected.", icon: CalendarDays },
+        { type: 'tata_daily', title: 'Tata Daily (Single Sheet)', description: "Single-sheet daily Tata export (e.g. '28th TATA'). Pass target date if the Date column is missing.", icon: Table },
+        { type: 'essl_daywise', title: 'ESSL Daywise (In/Out)', description: "Single-day ESSL export with 'Essl In' and/or 'Essl Out' sheets. Date is auto-detected from headers.", icon: FileText },
         { type: 'master', title: 'Master Data', description: 'Employee roster (PR, Bio, WC/BC, Vendor, Store, Designation)', icon: Database },
-        { type: 'essl', title: 'ESSL Biometric', description: 'Raw biometric punches from ESSL machine (cross-tab format)', icon: FileText },
-        { type: 'tata', title: 'Tata Daily', description: 'Official daily attendance from Tata - reads every sheet (one per day)', icon: Table },
+        { type: 'essl', title: 'ESSL Biometric (Monthly)', description: 'Raw biometric punches from ESSL machine (cross-tab format, multi-sheet)', icon: FileText },
+        { type: 'tata', title: 'Tata Monthly', description: 'Official monthly attendance from Tata - reads every sheet (one per day)', icon: Table },
         { type: 'tata_all', title: 'Tata All (Monthly)', description: 'Monthly historical data for trends and analytics', icon: FileUp }
     ];
 
@@ -175,10 +179,12 @@ export default function UploadCenter() {
     // with the file format - flag it instead of letting it pass silently.
     const suspiciouslyFewSheets = lastResult?.sheets_read !== undefined && lastResult.sheets_read <= 1;
     const isDaywiseResult = lastResult?.type === 'daywise';
+    const isTataDailyResult = lastResult?.type === 'tata_daily';
+    const isEsslDaywiseResult = lastResult?.type === 'essl_daywise';
 
     return (
         <div className="space-y-6 fade-in">
-            <SectionHeader title="Upload Center" subtitle="Upload Master, ESSL, Tata, Tata All, and Day-wise combined files" />
+            <SectionHeader title="Upload Center" subtitle="Upload Master, ESSL, Tata, Tata Daily, ESSL Daywise, and Day-wise combined files" />
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {uploadZones.map((zone) => (
@@ -211,7 +217,52 @@ export default function UploadCenter() {
                 </Card>
             )}
 
-            {lastResult && !isDaywiseResult && (
+            {lastResult && isTataDailyResult && (
+                <Card className="p-4 flex items-start gap-3 border-emerald-200 bg-emerald-50">
+                    <CheckCircle2 className="text-emerald-600 shrink-0 mt-0.5" size={18} />
+                    <div className="text-sm w-full">
+                        <p className="font-semibold text-slate-800">
+                            {lastResult.filename}: {lastResult.rows_processed?.toLocaleString()} rows processed
+                        </p>
+                        {lastResult.dates_covered !== undefined && (
+                            <p className="text-xs text-slate-600 mt-0.5">
+                                {lastResult.dates_covered} date(s) covered: {lastResult.date_range}
+                            </p>
+                        )}
+                        {lastResult.message && <p className="text-xs text-slate-600 mt-0.5">{lastResult.message}</p>}
+                    </div>
+                </Card>
+            )}
+
+            {lastResult && isEsslDaywiseResult && (
+                <Card className="p-4 flex items-start gap-3 border-emerald-200 bg-emerald-50">
+                    <CheckCircle2 className="text-emerald-600 shrink-0 mt-0.5" size={18} />
+                    <div className="text-sm w-full">
+                        <p className="font-semibold text-slate-800">
+                            {lastResult.filename}: {lastResult.rows_processed?.toLocaleString()} ESSL rows processed
+                        </p>
+                        {lastResult.date && (
+                            <p className="text-xs text-slate-600 mt-0.5">
+                                Date detected: {lastResult.date}
+                            </p>
+                        )}
+                        {lastResult.employees_matched !== undefined && (
+                            <p className="text-xs text-slate-600 mt-0.5">
+                                {lastResult.employees_matched} employee(s) matched to master roster.
+                            </p>
+                        )}
+                        {lastResult.sheets_found && (
+                            <div className="flex flex-wrap items-center gap-2 mt-2">
+                                <SheetFoundPill label="Essl In" found={!!lastResult.sheets_found?.essl_in} />
+                                <SheetFoundPill label="Essl Out" found={!!lastResult.sheets_found?.essl_out} />
+                            </div>
+                        )}
+                        {lastResult.message && <p className="text-xs text-slate-600 mt-0.5">{lastResult.message}</p>}
+                    </div>
+                </Card>
+            )}
+
+            {lastResult && !isDaywiseResult && !isTataDailyResult && !isEsslDaywiseResult && (
                 <Card className={`p-4 flex items-start gap-3 ${suspiciouslyFewSheets ? 'border-amber-200 bg-amber-50' : 'border-emerald-200 bg-emerald-50'}`}>
                     {suspiciouslyFewSheets ? (
                         <AlertTriangle className="text-amber-600 shrink-0 mt-0.5" size={18} />
