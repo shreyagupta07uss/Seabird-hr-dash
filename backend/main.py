@@ -54,7 +54,8 @@ from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, date, timedelta, time
 import json
 import csv
-import io as bio
+import io
+from io import BytesIO as bio
 import os
 import re
 import hashlib
@@ -1106,7 +1107,7 @@ def absentee_percentage(absent: int, headcount: int) -> float:
 # ============================================================================
 
 def read_excel_bytes_to_dicts(file_bytes: bytes, sheet_index: int = 0) -> List[Dict[str, Any]]:
-    wb = load_workbook(filename=bio.BytesIO(file_bytes), read_only=True, data_only=True)
+    wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb.worksheets[sheet_index] if sheet_index < len(wb.worksheets) else wb.active
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
@@ -1125,7 +1126,7 @@ def read_excel_bytes_to_dicts(file_bytes: bytes, sheet_index: int = 0) -> List[D
     return result
 
 def read_excel_all_sheets_to_dicts(file_bytes: bytes, required_any_header: Optional[List[str]] = None) -> Dict[str, Any]:
-    wb = load_workbook(filename=bio.BytesIO(file_bytes), read_only=True, data_only=True)
+    wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
     all_rows: List[Dict[str, Any]] = []
     sheets_read = 0
     sheets_skipped = 0
@@ -1150,7 +1151,7 @@ def read_excel_all_sheets_to_dicts(file_bytes: bytes, required_any_header: Optio
     return {"rows": all_rows, "sheets_read": sheets_read, "sheets_skipped": sheets_skipped}
 
 def read_excel_raw_rows(file_bytes: bytes, sheet_index: int = 0) -> List[List[Any]]:
-    wb = load_workbook(filename=bio.BytesIO(file_bytes), read_only=True, data_only=True)
+    wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
     ws = wb.worksheets[sheet_index] if sheet_index < len(wb.worksheets) else wb.active
     rows = list(ws.iter_rows(values_only=True))
     wb.close()
@@ -2154,7 +2155,7 @@ def _pick_master_sheet(file_bytes: bytes, sheet_name_override: Optional[str] = N
     Always returns sheet_info listing every sheet's row count, so even a wrong
     auto-pick is immediately visible in the API response instead of a silent undercount.
     """
-    wb = load_workbook(filename=bio.BytesIO(file_bytes), read_only=True, data_only=True)
+    wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
     sheet_info = []
     candidates = []  # (name, non_empty_row_count, worksheet_index)
     for idx, ws in enumerate(wb.worksheets):
@@ -2860,7 +2861,7 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     filename_month = _extract_month_from_filename(file.filename)
 
     try:
-        wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
+        wb = load_workbook(filename=BytesIO(contents), read_only=True, data_only=True)
     except Exception as e:
         db.add(UploadLog(file_type="essl", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
         db.commit()
@@ -3106,7 +3107,7 @@ def preview_essl(file: UploadFile = File(...)):
     filename_month = _extract_month_from_filename(file.filename)
 
     try:
-        wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
+        wb = load_workbook(filename=BytesIO(contents), read_only=True, data_only=True)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
 
@@ -3347,6 +3348,126 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
 
 
 @app.post("/api/v1/upload/tata-daily")
+
+# ============================================================================
+# ROBUST EXCEL HEADER DETECTION (for single-sheet daily uploads)
+# ============================================================================
+
+_TATA_HEADER_KEYWORDS = {
+    "paycode": ["paycode", "pay code", "emp code", "emp_code", "code", "pr number", "pr_number", "pr no", "prno", "empcode", "employee code", "employee_code"],
+    "emp_name": ["employee name", "emp name", "emp_name", "name", "employee_name", "empname"],
+    "date": ["date", "att date", "attendance date", "att_date", "day"],
+    "in_time": ["in time", "in_time", "intime", "time in", "time_in", "in", "punch in", "punch_in", "check in", "check_in"],
+    "out_time": ["out time", "out_time", "outtime", "time out", "time_out", "out", "punch out", "punch_out", "check out", "check_out"],
+    "man_hrs": ["man hrs", "man_hrs", "manhours", "man hours", "hours", "worked hours", "worked_hours", "total hours", "total_hours", "hrs"],
+    "status": ["status", "att status", "attendance status", "att_status", "present status", "present_status"],
+    "shift": ["shift", "shift in time", "shift_in_time", "shift time", "shift_time", "sft"],
+    "department": ["department", "dept", "division", "section", "deptt"],
+    "division": ["division", "dept", "department", "section"],
+    "category": ["wc/bc", "wc_bc", "wc-bc", "category", "wc", "bc", "wc bc"],
+    "contractor": ["contractor", "vendor", "agency", "subcontractor", "sub contractor"],
+    "store": ["store", "location", "plant", "unit", "site"],
+    "early_going": ["early going", "early_going", "early departure", "early_departure", "early"],
+    "shift_late": ["shift late", "shift_late", "late shift", "late_shift"],
+}
+
+def _normalize_header(header: str) -> str:
+    """Normalize a header string for fuzzy matching."""
+    if header is None:
+        return ""
+    return str(header).strip().lower().replace("/", " ").replace("-", " ").replace("_", " ")
+
+def _find_tata_header_row(raw_rows: List[List[Any]], max_scan: int = 15) -> Optional[Dict[str, Any]]:
+    """Scan the first N rows to find the one that looks most like a Tata header.
+    Returns {row_idx, column_map} where column_map maps canonical names to column indices."""
+    best_score = 0
+    best_result = None
+
+    for i, row in enumerate(raw_rows[:max_scan]):
+        if not row or len(row) < 3:
+            continue
+        col_map = {}
+        score = 0
+        for j, cell in enumerate(row):
+            if cell is None:
+                continue
+            norm = _normalize_header(str(cell))
+            if not norm:
+                continue
+            for canonical, keywords in _TATA_HEADER_KEYWORDS.items():
+                if canonical in col_map:
+                    continue  # already mapped
+                for kw in keywords:
+                    if kw == norm or kw in norm:
+                        col_map[canonical] = j
+                        score += 1
+                        break
+        # A good header row should have at least paycode + name + date, or paycode + in_time + out_time
+        has_essentials = ("paycode" in col_map and "emp_name" in col_map) or                          ("paycode" in col_map and ("in_time" in col_map or "out_time" in col_map))
+        if has_essentials and score > best_score:
+            best_score = score
+            best_result = {"row_idx": i, "column_map": col_map, "raw_headers": [str(h) if h is not None else "" for h in row]}
+
+    return best_result
+
+def _parse_tata_rows_with_header(raw_rows: List[List[Any]], header_info: Dict[str, Any], target_date: Optional[date] = None) -> List[Dict[str, Any]]:
+    """Parse Tata rows using the detected header mapping."""
+    col_map = header_info["column_map"]
+    row_idx = header_info["row_idx"]
+    parsed = []
+
+    for row in raw_rows[row_idx + 1:]:
+        if not row or all(v is None for v in row):
+            continue
+
+        def get_val(canonical: str, default=""):
+            idx = col_map.get(canonical)
+            if idx is None or idx >= len(row):
+                return default
+            val = row[idx]
+            if val is None:
+                return default
+            return str(val).strip()
+
+        paycode = get_val("paycode")
+        if not paycode:
+            continue
+
+        # Parse date from row, or use target_date
+        date_val = get_val("date")
+        att_date = parse_date_br(date_val) if date_val else None
+        if not att_date and target_date:
+            att_date = target_date
+        if not att_date:
+            continue
+
+        # Parse man_hrs
+        man_hrs_raw = get_val("man_hrs", "0")
+        try:
+            man_hrs = float(man_hrs_raw) if man_hrs_raw else 0
+        except:
+            man_hrs = 0
+
+        parsed.append({
+            "paycode": paycode,
+            "emp_name": get_val("emp_name"),
+            "att_date": att_date,
+            "in_time": safe_time(parse_time_br(get_val("in_time"))),
+            "out_time": safe_time(parse_time_br(get_val("out_time"))),
+            "man_hrs": man_hrs,
+            "status_val": get_val("status", "P").upper() or "P",
+            "dept_from_row": get_val("department") or get_val("division"),
+            "division_from_row": get_val("division"),
+            "row_shift_raw": get_val("shift") or None,
+            "category_raw": get_val("category"),
+            "contractor_raw": get_val("contractor"),
+            "store_raw": get_val("store"),
+            "early_going": get_val("early_going"),
+            "shift_late": get_val("shift_late"),
+        })
+
+    return parsed
+
 def upload_tata_daily(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
     """Single-sheet daily Tata upload — optimized for one-day exports like '28th TATA'.
     Pass target_date (DD/MM/YYYY or YYYY-MM-DD) to override the Date column if missing/unreliable."""
@@ -3360,12 +3481,64 @@ def upload_tata_daily(file: UploadFile = File(...), target_date: Optional[str] =
         if existing:
             return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
 
+    # Try robust header detection first
     try:
-        rows = read_excel_bytes_to_dicts(contents, sheet_index=0)
+        wb = load_workbook(filename=BytesIO(contents), read_only=True, data_only=True)
+        ws = wb.worksheets[0] if wb.worksheets else wb.active
+        raw_rows = list(ws.iter_rows(values_only=True))
+        wb.close()
     except Exception as e:
         db.add(UploadLog(file_type="tata_daily", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
         db.commit()
         raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
+
+    header_info = _find_tata_header_row(raw_rows)
+
+    # Parse target_date if provided
+    parsed_target_date = parse_date_br(target_date) if target_date else None
+
+    if header_info:
+        rows = _parse_tata_rows_with_header(raw_rows, header_info, target_date=parsed_target_date)
+        detected_headers = header_info.get("raw_headers", [])
+    else:
+        # Fallback to old simple dict parsing
+        try:
+            rows = read_excel_bytes_to_dicts(contents, sheet_index=0)
+        except Exception as e:
+            db.add(UploadLog(file_type="tata_daily", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
+            db.commit()
+            raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
+        detected_headers = list(rows[0].keys()) if rows else []
+
+        # Convert dict rows to the same format
+        parsed_rows = []
+        for row in rows:
+            paycode = str(row.get("PayCode", row.get("Pay Code", row.get("paycode", "")))).strip()
+            att_date = parse_date_br(row.get("Date", row.get("date", "")))
+            if not paycode:
+                continue
+            if not att_date and parsed_target_date:
+                att_date = parsed_target_date
+            if not att_date:
+                continue
+            parsed_rows.append({
+                "paycode": paycode,
+                "emp_name": str(row.get("Employee Name", row.get("EMP Name", row.get("EmployeeName", "")))).strip(),
+                "att_date": att_date,
+                "in_time": safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", ""))))),
+                "out_time": safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", ""))))),
+                "man_hrs": float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0),
+                "status_val": str(row.get("Status", row.get("status", "P"))).strip().upper(),
+                "dept_from_row": str(row.get("Department", row.get("department", ""))).strip(),
+                "division_from_row": str(row.get("Division", "")).strip(),
+                "row_shift_raw": row.get("Shift", row.get("Shift In Time", None)),
+                "category_raw": str(row.get("WC/BC", "")).strip(),
+                "contractor_raw": str(row.get("Contractor", "")).strip(),
+                "store_raw": str(row.get("Store", "")).strip(),
+                "early_going": str(row.get("Early Going", "")).strip(),
+                "shift_late": str(row.get("Shift Late", "")).strip(),
+            })
+        rows = parsed_rows
 
     # Prefetch employees once
     all_employees = db.query(Employee).all()
@@ -3388,36 +3561,23 @@ def upload_tata_daily(file: UploadFile = File(...), target_date: Optional[str] =
     parsed = []
     all_dates = set()
     for row in rows:
-        paycode = str(row.get("PayCode", row.get("Pay Code", row.get("paycode", "")))).strip()
-        att_date = parse_date_br(row.get("Date", row.get("date", "")))
+        paycode = row.get("paycode", "")
+        att_date = row.get("att_date")
         if not paycode:
             continue
-        # If target_date is provided and row date is missing/unparseable, use target_date
-        if not att_date and target_date:
-            att_date = parse_date_br(target_date)
         if not att_date:
             continue
-        parsed.append({
-            "paycode": paycode,
-            "emp_name": str(row.get("Employee Name", row.get("EMP Name", row.get("EmployeeName", "")))).strip(),
-            "att_date": att_date,
-            "in_time": safe_time(parse_time_br(row.get("In Time", row.get("In_Time", row.get("IN", ""))))),
-            "out_time": safe_time(parse_time_br(row.get("Out Time", row.get("Out_Time", row.get("OUT", ""))))),
-            "man_hrs": float(row.get("Man Hrs", row.get("Man_Hrs", 0)) or 0),
-            "status_val": str(row.get("Status", row.get("status", "P"))).strip().upper(),
-            "dept_from_row": str(row.get("Department", row.get("department", ""))).strip(),
-            "division_from_row": str(row.get("Division", "")).strip(),
-            "row_shift_raw": row.get("Shift", row.get("Shift In Time", None)),
-            "category_raw": str(row.get("WC/BC", "")).strip(),
-            "contractor_raw": str(row.get("Contractor", "")).strip(),
-            "store_raw": str(row.get("Store", "")).strip(),
-            "early_going": str(row.get("Early Going", "")).strip(),
-            "shift_late": str(row.get("Shift Late", "")).strip(),
-        })
+        parsed.append(row)
         all_dates.add(att_date)
 
     if not parsed:
-        raise HTTPException(status_code=400, detail="No valid rows found in the file. Expected columns: PayCode, Employee Name, Date, In Time, Out Time, Man Hrs, Status, Shift, Department, Division, WC/BC, Contractor, Store")
+        header_preview = ", ".join(detected_headers[:15]) if detected_headers else "(no headers detected)"
+        raise HTTPException(
+            status_code=400, 
+            detail=f"No valid rows found. Detected headers: {header_preview}. "
+                   f"Expected columns like: PayCode, Employee Name, Date, In Time, Out Time, Man Hrs, Status, Shift, Department, Division, WC/BC, Contractor, Store. "
+                   f"If your file has a title row above the headers, or different column names, try passing target_date explicitly."
+        )
 
     # Bulk-fetch existing TataAttendance rows for the date range touched
     existing_map = {}
@@ -3635,7 +3795,7 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
     filename_month = _extract_month_from_filename(file.filename)
 
     try:
-        wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
+        wb = load_workbook(filename=BytesIO(contents), read_only=True, data_only=True)
     except Exception as e:
         db.add(UploadLog(file_type="daywise", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
         db.commit()
@@ -3876,7 +4036,7 @@ def upload_essl_daywise(file: UploadFile = File(...), target_date: Optional[str]
             return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
 
     try:
-        wb = load_workbook(filename=bio.BytesIO(contents), read_only=True, data_only=True)
+        wb = load_workbook(filename=BytesIO(contents), read_only=True, data_only=True)
     except Exception as e:
         db.add(UploadLog(file_type="essl_daywise", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
         db.commit()
@@ -5999,7 +6159,7 @@ def download_dump_report(
                 ws.freeze_panes = "A2"
 
         # ── Save to buffer ──
-        buf = bio.BytesIO()
+        buf = BytesIO()
         wb.save(buf)
         buf.seek(0)
         elapsed = round(time.time() - start_time, 2)

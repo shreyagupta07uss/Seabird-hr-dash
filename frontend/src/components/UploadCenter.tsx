@@ -82,6 +82,7 @@ export default function UploadCenter() {
     const [lastResult, setLastResult] = useState<UploadResult | null>(null);
     const [deletingId, setDeletingId] = useState<number | null>(null);
     const [deletingAll, setDeletingAll] = useState(false);
+    const [targetDate, setTargetDate] = useState<string>("");
 
     const loadHistory = async () => {
         try {
@@ -110,7 +111,7 @@ export default function UploadCenter() {
                 // New: single workbook with 'Essl In' / 'Essl Out' / 'Tata' sheets for one day.
                 // The backend auto-detects the date from the Tata sheet, so no extra input needed here.
                 case 'daywise': result = await api.uploadDaywise(file); break;
-                case 'tata_daily': result = await api.uploadTataDaily(file); break;
+                case 'tata_daily': result = await api.uploadTataDaily(file, targetDate || undefined); break;
                 case 'essl_daywise': result = await api.uploadEsslDaywise(file); break;
                 default: throw new Error(`Unknown upload type: ${type}`);
             }
@@ -185,6 +186,29 @@ export default function UploadCenter() {
     return (
         <div className="space-y-6 fade-in">
             <SectionHeader title="Upload Center" subtitle="Upload Master, ESSL, Tata, Tata Daily, ESSL Daywise, and Day-wise combined files" />
+
+            {uploadingType === 'tata_daily' && (
+                <Card className="p-4 mb-4 border-blue-200 bg-blue-50">
+                    <div className="flex items-center gap-3">
+                        <CalendarDays className="text-blue-600 shrink-0" size={18} />
+                        <div className="flex-1">
+                            <label className="block text-xs font-semibold text-slate-700 mb-1">
+                                Target Date (optional)
+                            </label>
+                            <input
+                                type="date"
+                                value={targetDate}
+                                onChange={(e) => setTargetDate(e.target.value)}
+                                className="w-full md:w-64 px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                placeholder="YYYY-MM-DD"
+                            />
+                            <p className="text-xs text-slate-500 mt-1">
+                                If the Excel file's Date column is missing or unreliable, set this to force the date (e.g. 2026-07-28).
+                            </p>
+                        </div>
+                    </div>
+                </Card>
+            )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {uploadZones.map((zone) => (
