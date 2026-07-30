@@ -2679,6 +2679,92 @@ def _parse_essl_sheet(raw_rows: List[List[Any]], sheet_name: str = "",
     return all_records, all_dates, debug
 
 
+_ESSL_FLAT_CODE_LABELS = ["EMP CODE", "EMP_CODE", "EMPCODE", "PAYCODE", "PAY CODE", "EMP.CODE", "EMPLOYEE CODE", "PRN", "BIO", "EMP ID", "EMPLOYEE ID", "CODE", "ID"]
+_ESSL_FLAT_NAME_LABELS = ["EMP NAME", "EMP_NAME", "EMPLOYEE NAME", "EMPLOYEE_NAME", "NAME"]
+_ESSL_FLAT_DATE_LABELS = ["DATE", "ATT DATE", "ATTENDANCE DATE", "PUNCH DATE", "DAY"]
+_ESSL_FLAT_IN_LABELS = ["IN TIME", "INTIME", "TIME IN", "PUNCH IN", "CHECK IN", "CHECKIN", "IN"]
+_ESSL_FLAT_OUT_LABELS = ["OUT TIME", "OUTTIME", "TIME OUT", "PUNCH OUT", "CHECK OUT", "CHECKOUT", "OUT"]
+_ESSL_FLAT_STATUS_LABELS = ["STATUS", "ATT STATUS", "ATTENDANCE STATUS"]
+
+
+def _find_essl_flat_header_row(raw_rows: List[List[Any]]) -> Optional[Dict[str, Any]]:
+    """Look for a header row for flat/long-row ESSL data: one row per employee per
+    date, e.g. columns like EMP Code | Name | Date | IN | OUT (any header spelling/
+    casing/order). Requires a code-like column, a date-like column, and at least one
+    of IN/OUT/STATUS to avoid false positives."""
+    for i, row in enumerate(raw_rows[:20]):
+        if len(row) < 3:
+            continue
+        code_col = name_col = date_col = in_col = out_col = status_col = None
+        for j, cell in enumerate(row):
+            if cell is None:
+                continue
+            h = str(cell).strip().upper()
+            if not h:
+                continue
+            if code_col is None and any(h == lbl or lbl in h for lbl in _ESSL_FLAT_CODE_LABELS) and "NAME" not in h:
+                code_col = j
+            elif name_col is None and any(h == lbl or lbl in h for lbl in _ESSL_FLAT_NAME_LABELS):
+                name_col = j
+            elif date_col is None and any(h == lbl or lbl in h for lbl in _ESSL_FLAT_DATE_LABELS):
+                date_col = j
+            elif in_col is None and any(h == lbl or lbl in h for lbl in _ESSL_FLAT_IN_LABELS):
+                in_col = j
+            elif out_col is None and any(h == lbl or lbl in h for lbl in _ESSL_FLAT_OUT_LABELS):
+                out_col = j
+            elif status_col is None and any(h == lbl or lbl in h for lbl in _ESSL_FLAT_STATUS_LABELS):
+                status_col = j
+        if code_col is not None and date_col is not None and (in_col is not None or out_col is not None or status_col is not None):
+            return {
+                "row_idx": i, "code_col": code_col, "name_col": name_col, "date_col": date_col,
+                "in_col": in_col, "out_col": out_col, "status_col": status_col,
+            }
+    return None
+
+
+def _parse_essl_sheet_flat(raw_rows: List[List[Any]]) -> List[Tuple[str, str, date, Optional[str], Optional[str], Optional[str]]]:
+    """Parse flat/long-row ESSL data (one row per employee per date) with fuzzy,
+    case-insensitive header matching. Used as a per-sheet fallback for any sheet
+    that isn't cross-tab, so mixed workbooks (some cross-tab sheets, some flat
+    sheets) are handled correctly instead of the flat sheet being dropped."""
+    header_info = _find_essl_flat_header_row(raw_rows)
+    if not header_info:
+        return []
+    header_idx = header_info["row_idx"]
+    code_col, name_col, date_col = header_info["code_col"], header_info["name_col"], header_info["date_col"]
+    in_col, out_col, status_col = header_info["in_col"], header_info["out_col"], header_info["status_col"]
+
+    records = []
+    for row in raw_rows[header_idx + 1:]:
+        if code_col >= len(row) or date_col >= len(row):
+            continue
+        code_val = row[code_col]
+        if code_val is None or str(code_val).strip() in ["", "-", "#N/A", "N/A"]:
+            continue
+        emp_code = str(code_val).strip()
+        att_date = parse_date_br(row[date_col])
+        if not att_date:
+            continue
+        emp_name = ""
+        if name_col is not None and name_col < len(row) and row[name_col] is not None:
+            emp_name = str(row[name_col]).strip()
+        raw_in = str(row[in_col]).strip() if in_col is not None and in_col < len(row) and row[in_col] is not None else ""
+        raw_out = str(row[out_col]).strip() if out_col is not None and out_col < len(row) and row[out_col] is not None else ""
+        in_time = parse_time_br(raw_in) if raw_in else None
+        out_time = parse_time_br(raw_out) if raw_out else None
+        essl_status = None
+        if status_col is not None and status_col < len(row) and row[status_col] is not None:
+            sv = str(row[status_col]).strip().upper()
+            if sv in ESSL_STATUS_MARKERS:
+                essl_status = sv
+        if not essl_status and raw_in.upper() in ESSL_STATUS_MARKERS:
+            essl_status = raw_in.upper()
+        elif not essl_status and raw_out.upper() in ESSL_STATUS_MARKERS:
+            essl_status = raw_out.upper()
+        records.append((emp_code, emp_name, att_date, in_time, out_time, essl_status))
+    return records
+
+
 @app.post("/api/v1/upload/essl")
 def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
     import time as time_module
@@ -2718,10 +2804,15 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
                 return e
         return emp_by_code.get(emp_code_val)
 
-    # Process ALL sheets — accumulate cross-tab records from every sheet that has one
+    # Process ALL sheets — accumulate cross-tab records from every sheet that has one,
+    # and for any sheet that ISN'T cross-tab, try flat/long-row parsing on that same
+    # sheet before giving up on it. This means mixed workbooks (some cross-tab sheets,
+    # some flat sheets) are handled correctly instead of the flat sheet being silently
+    # dropped just because other sheets in the file were cross-tab.
     all_records = []
     all_dates = set()
     sheets_processed = 0
+    flat_sheets_processed = 0
     for ws in wb.worksheets:
         raw_rows = list(ws.iter_rows(values_only=True))
         sheet_records, sheet_dates, sheet_debug = _parse_essl_sheet(raw_rows, ws.title, filename_month)
@@ -2729,6 +2820,14 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
             all_records.extend(sheet_records)
             all_dates.update(sheet_dates)
             sheets_processed += 1
+            continue
+        # This sheet had no cross-tab structure — try it as flat/long-row data instead.
+        flat_records = _parse_essl_sheet_flat(raw_rows)
+        if flat_records:
+            for emp_code, emp_name, att_date, in_time, out_time, essl_status in flat_records:
+                all_records.append((emp_code, emp_name, "G", att_date.isoformat(), in_time, out_time, essl_status, {}))
+                all_dates.add(att_date)
+            flat_sheets_processed += 1
     wb.close()
 
     # FLAT FORMAT FALLBACK: no cross-tab sheets found in any worksheet
