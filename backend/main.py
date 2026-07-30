@@ -62,6 +62,7 @@ import secrets
 import uuid
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Date, Boolean, Text, ForeignKey, func, desc, text
 from sqlalchemy.orm import declarative_base
@@ -189,6 +190,81 @@ class Employee(Base):
     essl_records = relationship("ESSLAttendance", back_populates="employee", cascade="all, delete-orphan")
     tata_records = relationship("TataAttendance", back_populates="employee", cascade="all, delete-orphan")
     ot_records = relationship("Overtime", back_populates="employee", cascade="all, delete-orphan")
+
+def build_employee_resolver(all_employees: List["Employee"]) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Build a safe employee-resolution function from the full employee list.
+
+    Resolution priority:
+      1. Exact PR number match
+      2. HR-supplied Bio/device code (Employee.bio_id, populated from the master
+         file's "Bio" column - this is the one authoritative code-to-PR mapping
+         that actually comes from HR, when present)
+      3. Previously-learned device code (Employee.emp_code, backfilled the first
+         time a row for that employee was safely resolved by PR or Bio)
+      4. Employee name - ONLY if that exact name belongs to a single active
+         employee.
+
+    Matching by name is unsafe whenever two or more employees share the same
+    name (common here - e.g. "VIPIN KUMAR" maps to 9 different real employees
+    in one ESSL export). Blindly matching on name in that case silently
+    attributes one person's attendance punches to a different person, and -
+    because emp_code then gets backfilled from that wrong match - the error
+    compounds on every future upload. Ambiguous names are therefore excluded
+    from the name lookup entirely: rows for those employees come back
+    unresolved (employee=None, punches preserved under the raw code) instead
+    of being silently merged into the wrong person's record.
+    """
+    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
+    emp_by_bio = {e.bio_id: e for e in all_employees if e.bio_id}
+    emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
+
+    name_counts: Dict[str, int] = {}
+    name_to_emp: Dict[str, "Employee"] = {}
+    for e in all_employees:
+        if not e.name:
+            continue
+        key = e.name.strip().upper()
+        name_counts[key] = name_counts.get(key, 0) + 1
+        name_to_emp[key] = e
+
+    ambiguous_names = {n for n, c in name_counts.items() if c > 1}
+    emp_by_name_safe = {n: e for n, e in name_to_emp.items() if n not in ambiguous_names}
+
+    stats = {
+        "ambiguous_name_count": len(ambiguous_names),
+        "ambiguous_names": ambiguous_names,
+        "unresolved_ambiguous_hits": 0,
+        "resolved_by": {"pr_number": 0, "bio_id": 0, "emp_code": 0, "name": 0},
+    }
+
+    def resolve(code_val: Optional[str], name_val: Optional[str]) -> Optional["Employee"]:
+        if code_val:
+            e = emp_by_pr.get(code_val)
+            if e:
+                stats["resolved_by"]["pr_number"] += 1
+                return e
+            e = emp_by_bio.get(code_val)
+            if e:
+                stats["resolved_by"]["bio_id"] += 1
+                return e
+            e = emp_by_code.get(code_val)
+            if e:
+                stats["resolved_by"]["emp_code"] += 1
+                return e
+        if name_val:
+            key = name_val.strip().upper()
+            if key in ambiguous_names:
+                stats["unresolved_ambiguous_hits"] += 1
+                return None
+            e = emp_by_name_safe.get(key)
+            if e:
+                stats["resolved_by"]["name"] += 1
+                return e
+        return None
+
+    return resolve, stats
+
 
 class ESSLAttendance(Base):
     __tablename__ = "essl_attendance"
@@ -2787,22 +2863,8 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
         raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
 
     all_employees = db.query(Employee).all()
-    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
-    emp_by_name = {}
-    for e in all_employees:
-        if e.name:
-            emp_by_name[e.name.strip().upper()] = e
+    resolve_employee_fast, resolver_stats = build_employee_resolver(all_employees)
     emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
-
-    def resolve_employee_fast(emp_code_val: str, emp_name_val: str):
-        e = emp_by_pr.get(emp_code_val)
-        if e:
-            return e
-        if emp_name_val:
-            e = emp_by_name.get(emp_name_val.strip().upper())
-            if e:
-                return e
-        return emp_by_code.get(emp_code_val)
 
     # Process ALL sheets — accumulate cross-tab records from every sheet that has one,
     # and for any sheet that ISN'T cross-tab, try flat/long-row parsing on that same
@@ -3005,7 +3067,10 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     return {
         "status": "success", "type": "essl", "format": "cross-tab", "rows_processed": processed,
         "employees_found": len(set(r[0] for r in all_records)), "date_columns": len(all_dates),
-        "sheets_processed": sheets_processed, "elapsed_seconds": elapsed, "filename": file.filename, "upload_log_id": upload_log_id
+        "sheets_processed": sheets_processed, "elapsed_seconds": elapsed, "filename": file.filename, "upload_log_id": upload_log_id,
+        "resolved_by": resolver_stats["resolved_by"],
+        "unresolved_ambiguous_name_hits": resolver_stats["unresolved_ambiguous_hits"],
+        "ambiguous_names_in_master": resolver_stats["ambiguous_name_count"],
     }
 
 
@@ -3120,20 +3185,8 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     # Prefetch every employee ONCE instead of up to 3 SELECTs per row (this was the
     # main cause of the timeout - a 30-sheet file could mean 30,000+ rows x 3 queries).
     all_employees = db.query(Employee).all()
-    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
     emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
-    emp_by_name = {e.name.strip().upper(): e for e in all_employees if e.name}
-
-    def resolve_employee_fast(paycode: str, emp_name_val: str):
-        e = emp_by_pr.get(paycode)
-        if e:
-            return e
-        e = emp_by_code.get(paycode)
-        if e:
-            return e
-        if emp_name_val:
-            return emp_by_name.get(emp_name_val.strip().upper())
-        return None
+    resolve_employee_fast, resolver_stats = build_employee_resolver(all_employees)
 
     # Pass 1: parse all rows in memory (no DB calls yet), track which dates are touched.
     parsed = []
@@ -3253,7 +3306,10 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     return {"status": "success", "type": "tata", "rows_processed": processed,
             "sheets_read": sheets_read, "sheets_skipped": sheets_skipped, "elapsed_seconds": elapsed,
             "filename": file.filename, "message": "Official attendance stored. Ready for reconciliation.",
-            "upload_log_id": upload_log_id}
+            "upload_log_id": upload_log_id,
+            "resolved_by": resolver_stats["resolved_by"],
+            "unresolved_ambiguous_name_hits": resolver_stats["unresolved_ambiguous_hits"],
+            "ambiguous_names_in_master": resolver_stats["ambiguous_name_count"]}
 
 @app.post("/api/v1/upload/tata-all")
 def upload_tata_all(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
@@ -3422,15 +3478,7 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
         raise HTTPException(status_code=400, detail="Couldn't determine the attendance date. Pass target_date (DD/MM/YYYY) explicitly, or make sure the Tata sheet's Date column is populated.")
 
     all_employees = db.query(Employee).all()
-    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
-    emp_by_name = {e.name.strip().upper(): e for e in all_employees if e.name}
-
-    def resolve_emp(code_val: Optional[str], name_val: Optional[str]):
-        if code_val and code_val in emp_by_pr:
-            return emp_by_pr[code_val]
-        if name_val and name_val.strip().upper() in emp_by_name:
-            return emp_by_name[name_val.strip().upper()]
-        return None
+    resolve_emp, resolver_stats = build_employee_resolver(all_employees)
 
     upload_log = UploadLog(file_type="daywise", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Processing")
     db.add(upload_log)
@@ -3580,6 +3628,33 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
 # RECONCILIATION ENDPOINTS
 # ============================================================================
 
+def _merge_duplicate_rows(rows: List[Any], fields: List[str]) -> Optional[Any]:
+    """Merge multiple rows that share the same key (pr_number, for one date)
+    into a single lightweight object, instead of a naive dict comprehension
+    that keeps only the last row it happens to iterate and silently discards
+    the other's data. This matters for any duplicate (pr_number, date) rows
+    left over from before the employee-resolution safety fix (ambiguous
+    employee names could previously cause two different people's punches to
+    land under the same pr_number/date) - one row might carry the IN time,
+    another the OUT time, and picking only one arbitrarily was producing
+    exactly that "IN blank / OUT filled" pattern on the dashboard. The row
+    with the most populated fields is used as the base, and any still-blank
+    fields are filled in from the other row(s)."""
+    if not rows:
+        return None
+    if len(rows) == 1:
+        return rows[0]
+    rows_sorted = sorted(rows, key=lambda r: sum(1 for f in fields if getattr(r, f, None)), reverse=True)
+    merged = SimpleNamespace(**{f: getattr(rows_sorted[0], f, None) for f in fields})
+    for r in rows_sorted[1:]:
+        for f in fields:
+            if not getattr(merged, f, None):
+                v = getattr(r, f, None)
+                if v:
+                    setattr(merged, f, v)
+    return merged
+
+
 def _get_essl_status(essl_record) -> Optional[str]:
     """FIX v3.2: Extract ESSL status from record (new status column or raw_punches fallback)."""
     if not essl_record:
@@ -3626,13 +3701,19 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
         ESSLAttendance.pr_number.in_(all_pr_numbers),
         ESSLAttendance.date == d
     ).all()
-    essl_map = {e.pr_number: e for e in all_essl}
+    essl_by_pr: Dict[str, List[Any]] = {}
+    for e in all_essl:
+        essl_by_pr.setdefault(e.pr_number, []).append(e)
+    essl_map = {pr: _merge_duplicate_rows(rows, ["in_time", "out_time", "shift", "status", "raw_punches"]) for pr, rows in essl_by_pr.items()}
 
     all_tata = db.query(TataAttendance).filter(
         TataAttendance.pr_number.in_(all_pr_numbers),
         TataAttendance.date == d
     ).all()
-    tata_map = {t.pr_number: t for t in all_tata}
+    tata_by_pr: Dict[str, List[Any]] = {}
+    for t in all_tata:
+        tata_by_pr.setdefault(t.pr_number, []).append(t)
+    tata_map = {pr: _merge_duplicate_rows(rows, ["in_time", "out_time", "shift", "status", "man_hrs"]) for pr, rows in tata_by_pr.items()}
 
     all_att = db.query(Attendance).filter(
         Attendance.pr_number.in_(all_pr_numbers),
@@ -3919,14 +4000,13 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
         # FIXED:
         existing_att = att_map.get(emp.pr_number)
         if existing_att:
-            essl_has_real_punches = bool(essl_in) or bool(essl_out)
-            tata_has_real_punches = bool(tata_in) or bool(tata_out)
-            if not essl_has_real_punches and tata_has_real_punches:
-                existing_att.essl_in = tata_in      # ← Now correct
-                existing_att.essl_out = tata_out
-            else:
-                existing_att.essl_in = essl_in
-                existing_att.essl_out = essl_out
+            # essl_in/essl_out reflect ONLY genuine ESSL punches (never mirrored
+            # from Tata) - final_in/final_out already carries the correct merged
+            # value for hours/OT calculations, and the "issue" field above (e.g.
+            # "Missing ESSL Punch") is computed assuming these columns tell the
+            # truth about what ESSL actually recorded.
+            existing_att.essl_in = essl_in
+            existing_att.essl_out = essl_out
             existing_att.tata_in = tata_in
             existing_att.tata_out = tata_out
             existing_att.final_in = final_in
@@ -3946,18 +4026,11 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
             existing_att.issue = issue
             existing_att.remark = remark
         else:
-                        # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
-            essl_has_real_punches = bool(essl_in) or bool(essl_out)
-            tata_has_real_punches = bool(tata_in) or bool(tata_out)
-            if not essl_has_real_punches and tata_has_real_punches:
-                essl_in_val = tata_in
-                essl_out_val = tata_out
-            else:
-                essl_in_val = essl_in
-                essl_out_val = essl_out
+            # essl_in/essl_out reflect ONLY genuine ESSL punches (never mirrored
+            # from Tata) - see comment in the existing_att branch above.
             db.add(Attendance(
                 employee_id=emp.id, pr_number=emp.pr_number, emp_code=emp.emp_code, date=d,
-                essl_in=essl_in_val, essl_out=essl_out_val, tata_in=tata_in, tata_out=tata_out,
+                essl_in=essl_in, essl_out=essl_out, tata_in=tata_in, tata_out=tata_out,
                 final_in=final_in, final_out=final_out, worked_hours=worked_hours, man_hrs=tata_man_hrs,
                 ot_hours=ot_hours, ot_headcount=ot_headcount, attendance_status=display_status,
                 late_minutes=late_minutes, early_minutes=early_minutes, single_punch=single_punch,
@@ -4116,20 +4189,22 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
             ESSLAttendance.date >= chunk_start,
             ESSLAttendance.date < chunk_end
         ).all()
-        essl_map = {}
+        essl_by_key: Dict[Tuple[str, str], List[Any]] = {}
         for e in all_essl:
             key = (e.pr_number, e.date.isoformat())
-            essl_map[key] = e
+            essl_by_key.setdefault(key, []).append(e)
+        essl_map = {key: _merge_duplicate_rows(rows, ["in_time", "out_time", "shift", "status", "raw_punches"]) for key, rows in essl_by_key.items()}
 
         all_tata = db.query(TataAttendance).filter(
             TataAttendance.pr_number.in_(pr_numbers),
             TataAttendance.date >= chunk_start,
             TataAttendance.date < chunk_end
         ).all()
-        tata_map = {}
+        tata_by_key: Dict[Tuple[str, str], List[Any]] = {}
         for t in all_tata:
             key = (t.pr_number, t.date.isoformat())
-            tata_map[key] = t
+            tata_by_key.setdefault(key, []).append(t)
+        tata_map = {key: _merge_duplicate_rows(rows, ["in_time", "out_time", "shift", "status", "man_hrs"]) for key, rows in tata_by_key.items()}
 
         all_att = db.query(Attendance).filter(
             Attendance.pr_number.in_(pr_numbers),
@@ -4434,16 +4509,12 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                 att_key = (emp.pr_number, d_iso)
                 if att_key in att_map:
                     existing = att_map[att_key]
-                    # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
-                    essl_has_real_punches = bool(essl_in) or bool(essl_out)
-                    tata_has_real_punches = bool(tata_in) or bool(tata_out)
-                    if not essl_has_real_punches and tata_has_real_punches:
-                        essl_in_upd, essl_out_upd = tata_in, tata_out
-                    else:
-                        essl_in_upd, essl_out_upd = essl_in, essl_out
+                    # essl_in/essl_out reflect ONLY genuine ESSL punches (never
+                    # mirrored from Tata) - final_in/final_out already carries the
+                    # correct merged value for hours/OT calculations.
                     attendance_updates.append({
                         "id": existing.id,
-                        "essl_in": essl_in_upd, "essl_out": essl_out_upd,
+                        "essl_in": essl_in, "essl_out": essl_out,
                         "tata_in": tata_in, "tata_out": tata_out,
                         "final_in": final_in, "final_out": final_out,
                         "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
@@ -4456,18 +4527,11 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                         "shift": shift, "category": category, "remark": remark,
                     })
                 else:
-                # UNIVERSAL MIRRORING: Fill ESSL with Tata when ESSL has no punch times
-                    essl_has_real_punches = bool(essl_in) or bool(essl_out)
-                    tata_has_real_punches = bool(tata_in) or bool(tata_out)
-                    if not essl_has_real_punches and tata_has_real_punches:
-                        essl_in_val = tata_in
-                        essl_out_val = tata_out
-                    else:
-                        essl_in_val = essl_in
-                        essl_out_val = essl_out
+                    # essl_in/essl_out reflect ONLY genuine ESSL punches (never
+                    # mirrored from Tata) - see comment in the update branch above.
                     attendance_to_insert.append({
                         "employee_id": emp.id, "pr_number": emp.pr_number, "emp_code": emp.emp_code, "date": d,
-                        "essl_in": essl_in_val, "essl_out": essl_out_val, "tata_in": tata_in, "tata_out": tata_out,
+                        "essl_in": essl_in, "essl_out": essl_out, "tata_in": tata_in, "tata_out": tata_out,
                         "final_in": final_in, "final_out": final_out, "worked_hours": worked_hours, "man_hrs": tata_man_hrs,
                         "ot_hours": ot_hours, "ot_headcount": ot_headcount, "attendance_status": display_status,
                         "late_minutes": late_minutes, "early_minutes": early_minutes, "single_punch": single_punch,
