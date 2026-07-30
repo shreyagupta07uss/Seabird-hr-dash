@@ -745,22 +745,28 @@ def get_shift_end_time(shift: Optional[str]) -> time:
     return get_shift_rule(shift)["end"]
 
 def bucket_shift_from_time(time_str: Optional[str]) -> Optional[str]:
-    """Return the shift code (A/G/B/C) whose window contains the given clock time.
-    This determines which shift an employee ACTUALLY worked, based on their real
-    IN punch time from Tata (falling back to ESSL) - as opposed to `assigned` shift,
-    which is just the roster label Tata assigns them for that day. Alternate Shift
-    should compare these two, not two copies of the same label."""
+    """Return the shift code (A/G/B/C) whose start time the given clock time falls
+    closest to. This determines which shift an employee ACTUALLY worked, based on
+    their real IN punch time from Tata (falling back to ESSL) - as opposed to
+    `assigned` shift, which is just the roster label Tata assigns them for that day.
+    Alternate Shift should compare these two, not two copies of the same label.
+
+    Boundaries are the midpoints between each shift's actual start time (from
+    SHIFT_RULES), so this always stays in sync with the real shift timings:
+      A starts 06:30, G starts 08:30, B starts 15:00, C starts 23:30
+      -> boundaries at 03:00 (C/A), 07:30 (A/G), 11:45 (G/B), 19:15 (B/C)
+    """
     t = parse_time_obj(time_str)
     if not t:
         return None
     mins = t.hour * 60 + t.minute
-    if 5.5 * 60 <= mins < 8.5 * 60:
+    if 180 <= mins < 450:      # 03:00 - 07:30 -> A (starts 06:30)
         return "A"
-    if 8.5 * 60 <= mins < 15 * 60:
+    if 450 <= mins < 705:      # 07:30 - 11:45 -> G (starts 08:30)
         return "G"
-    if 15 * 60 <= mins < 23.5 * 60:
+    if 705 <= mins < 1155:     # 11:45 - 19:15 -> B (starts 15:00)
         return "B"
-    return "C"
+    return "C"                 # 19:15 - 03:00 (wraps midnight) -> C (starts 23:30)
 
 def normalize_category(category: Optional[str]) -> str:
     if category is None:
@@ -1488,23 +1494,24 @@ def determine_worked_shift(essl_in, essl_out, tata_in, tata_out, assigned_shift,
 
     worked_hours = (out_mins - in_mins) / 60
 
-    # Determine start shift from IN time
-    if 5.5*60 <= in_mins < 8.5*60:
+    # Determine start shift from IN time (boundaries = midpoints between actual
+    # shift start times: A=06:30, G=08:30, B=15:00, C=23:30 -> see bucket_shift_from_time)
+    if 180 <= in_mins < 450:
         start_shift = "A"
-    elif 8.5*60 <= in_mins < 15*60:
+    elif 450 <= in_mins < 705:
         start_shift = "G"
-    elif 15*60 <= in_mins < 23.5*60:
+    elif 705 <= in_mins < 1155:
         start_shift = "B"
     else:
         start_shift = "C"
 
     # Determine end shift from OUT time (with tolerance)
     out_mins_norm = out_mins % (24*60)
-    if 5.5*60 <= out_mins_norm < 8.5*60:
+    if 180 <= out_mins_norm < 450:
         end_shift = "A"
-    elif 8.5*60 <= out_mins_norm < 15*60:
+    elif 450 <= out_mins_norm < 705:
         end_shift = "G"
-    elif 15*60 <= out_mins_norm < 23.5*60:
+    elif 705 <= out_mins_norm < 1155:
         end_shift = "B"
     else:
         end_shift = "C"
