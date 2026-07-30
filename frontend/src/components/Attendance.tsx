@@ -154,7 +154,7 @@ export default function Attendance() {
 
     const statusFilters = ['all', 'Present', 'Absent'];
     const otFilters = ['all', 'OT > 2hrs', 'OT < 2hrs', 'OT = 4hrs'];
-    const issueFilters = ['all', 'Alternate Shift', 'Time Difference', 'Single Punch', 'Late Punch', 'Early Departure', 'Week Off', 'Absent'];
+    const issueFilters = ['all', 'Missing ESSL Punch', 'Missing Tata Punch', 'No Data', 'Alternate Shift', 'Time Difference', 'Single Punch', 'Late Punch', 'Early Departure', 'Week Off', 'Absent'];
 
     return (
         <div className="space-y-6 fade-in">
@@ -351,6 +351,7 @@ export default function Attendance() {
                                         {r.issue && r.issue !== '-' ? (
                                             <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                                                 r.issue === 'Absent' ? 'bg-rose-100 text-rose-700' :
+                                                r.issue === 'No Data' ? 'bg-rose-100 text-rose-700' :
                                                 r.issue === 'Missing ESSL Punch' ? 'bg-amber-100 text-amber-700' :
                                                 r.issue === 'Missing Tata Punch' ? 'bg-amber-100 text-amber-700' :
                                                 r.issue === 'Time Difference (>15 min)' ? 'bg-red-100 text-red-700' :
