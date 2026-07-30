@@ -4034,9 +4034,9 @@ def _extract_date_from_essl_daywise_sheet(ws, filename_month=None):
 
 @app.post("/api/v1/upload/essl-daywise")
 def upload_essl_daywise(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
-    """Single-day ESSL-only upload: one workbook with 'Essl In' and/or 'Essl Out' sheets.
-    This is the raw export format from the ESSL portal. Parses IN/OUT times and status
-    markers (WO, A, L, P, SP, HD) and upserts into ESSLAttendance for the detected date.
+    """Single-day ESSL-only upload: handles both dual-sheet (Essl In / Essl Out)
+    and single-sheet flat formats (e.g. 'Monthly Status Report').
+    Supports both .xlsx (openpyxl) and .xls (xlrd) files.
     Pass target_date (DD/MM/YYYY or YYYY-MM-DD) to override auto-detection."""
     contents = file.file.read()
     file_hash = hashlib.sha256(contents).hexdigest()
@@ -4045,35 +4045,45 @@ def upload_essl_daywise(file: UploadFile = File(...), target_date: Optional[str]
         if existing:
             return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
 
+    # ── Parse workbook: .xlsx via openpyxl, .xls via xlrd ──
+    wb = None
+    raw_rows_by_sheet: Dict[str, List[List[Any]]] = {}
+    file_ext = (file.filename or "").lower().split(".")[-1] if "." in (file.filename or "") else "xlsx"
+
     try:
-        wb = load_workbook(filename=BytesIO(contents), read_only=True, data_only=True)
+        if file_ext == "xls":
+            try:
+                import xlrd
+                book = xlrd.open_workbook(file_contents=contents)
+                for sheet_idx in range(book.nsheets):
+                    sheet = book.sheet_by_index(sheet_idx)
+                    rows = []
+                    for r in range(sheet.nrows):
+                        rows.append([sheet.cell_value(r, c) for c in range(sheet.ncols)])
+                    raw_rows_by_sheet[sheet.name] = rows
+            except ImportError:
+                raise HTTPException(status_code=400, detail=".xls files require 'xlrd' package. Install it or convert to .xlsx.")
+        else:
+            wb = load_workbook(filename=BytesIO(contents), read_only=True, data_only=True)
+            for ws in wb.worksheets:
+                raw_rows_by_sheet[ws.title] = list(ws.iter_rows(values_only=True))
     except Exception as e:
         db.add(UploadLog(file_type="essl_daywise", filename=file.filename, file_hash=file_hash, rows_processed=0, status="Failed", error_message=str(e)))
         db.commit()
         raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {str(e)}")
 
-    essl_in_ws = _find_sheet_by_keywords(wb, ["essl", "in"], must_not_contain=["out"])
-    essl_out_ws = _find_sheet_by_keywords(wb, ["essl", "out"])
-
-    if essl_in_ws is None and essl_out_ws is None:
-        wb.close()
-        raise HTTPException(status_code=400, detail="Couldn't find 'Essl In' or 'Essl Out' sheets. Expected at least one (case/spacing doesn't matter).")
+    # ── Try dual-sheet mode first (Essl In / Essl Out) ──
+    essl_in_rows = None
+    essl_out_rows = None
+    for sheet_name, rows in raw_rows_by_sheet.items():
+        name_norm = re.sub(r"[^a-z]", "", sheet_name.lower())
+        if "essl" in name_norm and "in" in name_norm and "out" not in name_norm:
+            essl_in_rows = rows
+        elif "essl" in name_norm and "out" in name_norm:
+            essl_out_rows = rows
 
     filename_month = _extract_month_from_filename(file.filename)
     resolved_date = parse_date_br(target_date) if target_date else None
-
-    if resolved_date is None:
-        for ws in [essl_in_ws, essl_out_ws]:
-            resolved_date = _extract_date_from_essl_daywise_sheet(ws, filename_month)
-            if resolved_date:
-                break
-
-    if resolved_date is None:
-        wb.close()
-        raise HTTPException(status_code=400, detail="Couldn't determine the attendance date. Pass target_date explicitly (DD/MM/YYYY or YYYY-MM-DD).")
-
-    in_data = _parse_essl_side_sheet(essl_in_ws) if essl_in_ws is not None else {}
-    out_data = _parse_essl_side_sheet(essl_out_ws) if essl_out_ws is not None else {}
 
     all_employees = db.query(Employee).all()
     emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
@@ -4091,56 +4101,188 @@ def upload_essl_daywise(file: UploadFile = File(...), target_date: Optional[str]
     db.flush()
     upload_log_id = upload_log.id
 
-    all_prns = set(in_data.keys()) | set(out_data.keys())
+    all_records = []  # List of (emp_code, emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches)
+    all_dates = set()
+
+    # ── Mode A: Dual-sheet In/Out ──
+    if essl_in_rows is not None or essl_out_rows is not None:
+        def parse_side_sheet(rows):
+            out: Dict[str, Dict[str, Any]] = {}
+            if not rows:
+                return out
+            for row in rows[1:]:
+                if not row or all(v is None for v in row):
+                    continue
+                prn = str(row[1]).strip() if len(row) > 1 and row[1] is not None else None
+                name = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+                if not prn:
+                    continue
+                raw_val = row[-1] if len(row) > 3 else None
+                raw_str = str(raw_val).strip() if raw_val is not None else ""
+                status_marker = raw_str.upper() if raw_str.upper() in ESSL_STATUS_MARKERS else None
+                time_val = parse_time_br(raw_val) if not status_marker else None
+                out[prn] = {"name": name, "time": time_val, "status": status_marker}
+            return out
+
+        in_data = parse_side_sheet(essl_in_rows) if essl_in_rows is not None else {}
+        out_data = parse_side_sheet(essl_out_rows) if essl_out_rows is not None else {}
+
+        # Detect date from header row
+        if resolved_date is None:
+            for rows in [essl_in_rows, essl_out_rows]:
+                if rows and rows[0]:
+                    last_header = rows[0][-1]
+                    if last_header is not None:
+                        d = parse_date_br(str(last_header).strip())
+                        if not d and filename_month:
+                            d = _parse_day_header(str(last_header).strip(), filename_month[0], filename_month[1])
+                        if not d:
+                            d = _parse_day_header(str(last_header).strip(), datetime.now().year, datetime.now().month)
+                        if d:
+                            resolved_date = d
+                            break
+
+        if resolved_date is None:
+            if wb:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+            raise HTTPException(status_code=400, detail="Couldn't determine the attendance date from ESSL In/Out headers. Pass target_date explicitly (DD/MM/YYYY or YYYY-MM-DD).")
+
+        all_prns = set(in_data.keys()) | set(out_data.keys())
+        for prn in all_prns:
+            in_rec = in_data.get(prn, {})
+            out_rec = out_data.get(prn, {})
+            name_val = in_rec.get("name") or out_rec.get("name") or ""
+            in_time = in_rec.get("time")
+            out_time = out_rec.get("time")
+            essl_status = in_rec.get("status") or out_rec.get("status")
+            all_records.append((prn, name_val, "G", resolved_date.isoformat(), in_time, out_time, essl_status, {}))
+            all_dates.add(resolved_date)
+
+    # ── Mode B: Single-sheet flat format (e.g. Monthly Status Report) ──
+    else:
+        # Try every sheet as a flat/long-row format
+        for sheet_name, rows in raw_rows_by_sheet.items():
+            flat_records = _parse_essl_sheet_flat(rows)
+            if flat_records:
+                for emp_code, emp_name, att_date, in_time, out_time, essl_status in flat_records:
+                    all_records.append((emp_code, emp_name, "G", att_date.isoformat(), in_time, out_time, essl_status, {}))
+                    all_dates.add(att_date)
+                # Use the first sheet that yields records
+                break
+
+        if not all_records:
+            if wb:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+            sheet_names = list(raw_rows_by_sheet.keys())
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No 'Essl In' / 'Essl Out' sheets found, and no flat-format data detected. "
+                    f"Sheets in file: {sheet_names}. "
+                    f"Expected either dual sheets (Essl In / Essl Out) or a single flat sheet with columns like: "
+                    f"EMP Code, Name, Date, IN, OUT. "
+                    f"If this is a .xls file, make sure xlrd is installed."
+                )
+            )
+
+        # Determine date from records or filename
+        if resolved_date is None and all_dates:
+            resolved_date = sorted(all_dates)[0]
+        if resolved_date is None and filename_month:
+            # Try to extract day from filename
+            day_match = re.search(r"(\d{4})-(\d{2})-(\d{2})", file.filename)
+            if day_match:
+                resolved_date = date(int(day_match.group(1)), int(day_match.group(2)), int(day_match.group(3)))
+
+        if resolved_date is None:
+            if wb:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+            raise HTTPException(status_code=400, detail="Couldn't determine the attendance date. Pass target_date explicitly (DD/MM/YYYY or YYYY-MM-DD).")
+
+    # ── Merge partial In-only / Out-only records ──
+    all_records = _merge_essl_records(all_records)
+
+    # ── Upsert into database ──
+    existing_keys = set()
+    if all_records and all_dates:
+        min_date = min(all_dates)
+        max_date = max(all_dates)
+        for pr, dt in db.query(ESSLAttendance.pr_number, ESSLAttendance.date).filter(
+            ESSLAttendance.date >= min_date,
+            ESSLAttendance.date <= max_date
+        ).all():
+            existing_keys.add((pr, dt.isoformat()))
+
     processed = 0
     matched = 0
+    to_insert = []
+    to_update = []
 
-    for prn in all_prns:
-        in_rec = in_data.get(prn, {})
-        out_rec = out_data.get(prn, {})
-        name_val = in_rec.get("name") or out_rec.get("name") or ""
-        in_time = in_rec.get("time")
-        out_time = out_rec.get("time")
-        essl_status = in_rec.get("status") or out_rec.get("status")
-
-        emp = resolve_emp(prn, name_val)
-
-        existing_essl = db.query(ESSLAttendance).filter(
-            ESSLAttendance.pr_number == prn,
-            ESSLAttendance.date == resolved_date
-        ).first()
-
-        if existing_essl:
-            existing_essl.in_time = safe_time(in_time) or existing_essl.in_time
-            existing_essl.out_time = safe_time(out_time) or existing_essl.out_time
-            existing_essl.status = essl_status or existing_essl.status
-            existing_essl.upload_log_id = upload_log_id
+    for emp_code, emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches in all_records:
+        emp = resolve_emp(emp_code, emp_name)
+        pr_number = emp.pr_number if emp else emp_code
+        if emp and not emp.emp_code:
+            emp.emp_code = emp_code
+            emp_by_pr[emp_code] = emp
+        att_date = datetime.fromisoformat(date_key).date()
+        key = (pr_number, date_key)
+        if key in existing_keys:
+            to_update.append({
+                "pr_number": pr_number,
+                "date": att_date,
+                "in_time": in_time,
+                "out_time": out_time,
+                "status": essl_status,
+                "raw_punches": json.dumps(raw_punches) if raw_punches else None,
+            })
         else:
-            db.add(ESSLAttendance(
-                employee_id=emp.id if emp else None,
-                pr_number=prn,
-                emp_code=prn,
-                emp_name=name_val,
-                date=resolved_date,
-                in_time=safe_time(in_time),
-                out_time=safe_time(out_time),
-                status=essl_status,
-                vendor=emp.vendor if emp else "",
-                store=emp.store if emp else "",
-                shift=safe_shift(emp.shift) if emp else "G",
-                upload_log_id=upload_log_id
-            ))
+            to_insert.append({
+                "employee_id": emp.id if emp else None,
+                "pr_number": pr_number,
+                "emp_code": emp_code,
+                "emp_name": emp_name,
+                "date": att_date,
+                "in_time": in_time,
+                "out_time": out_time,
+                "status": essl_status,
+                "raw_punches": json.dumps(raw_punches) if raw_punches else None,
+                "vendor": emp.vendor if emp else "",
+                "store": emp.store if emp else "",
+                "shift": safe_shift(shift),
+                "upload_log_id": upload_log_id,
+            })
         processed += 1
         if emp:
             matched += 1
-        if processed % 500 == 0:
-            db.commit()
 
-    db.commit()
-    try:
-        wb.close()
-    except Exception:
-        pass
+    if to_insert:
+        db.execute(ESSLAttendance.__table__.insert(), to_insert)
+    for upd in to_update:
+        db.query(ESSLAttendance).filter(
+            ESSLAttendance.pr_number == upd["pr_number"],
+            ESSLAttendance.date == upd["date"]
+        ).update({
+            ESSLAttendance.in_time: upd["in_time"] or ESSLAttendance.in_time,
+            ESSLAttendance.out_time: upd["out_time"] or ESSLAttendance.out_time,
+            ESSLAttendance.status: upd["status"] or ESSLAttendance.status,
+            ESSLAttendance.raw_punches: upd["raw_punches"] or ESSLAttendance.raw_punches,
+            ESSLAttendance.upload_log_id: upload_log_id,
+        }, synchronize_session=False)
+
+    if wb:
+        try:
+            wb.close()
+        except Exception:
+            pass
 
     upload_log.status = "Success"
     upload_log.rows_processed = processed
@@ -4149,18 +4291,18 @@ def upload_essl_daywise(file: UploadFile = File(...), target_date: Optional[str]
     return {
         "status": "success",
         "type": "essl_daywise",
-        "date": resolved_date.isoformat(),
-        "sheets_found": {"essl_in": essl_in_ws is not None, "essl_out": essl_out_ws is not None},
+        "date": resolved_date.isoformat() if resolved_date else None,
+        "sheets_found": {
+            "essl_in": essl_in_rows is not None,
+            "essl_out": essl_out_rows is not None,
+            "flat_format": essl_in_rows is None and essl_out_rows is None and len(all_records) > 0
+        },
         "rows_processed": processed,
         "employees_matched": matched,
         "filename": file.filename,
-        "message": f"ESSL day-wise attendance stored for {resolved_date.isoformat()}. Run reconciliation for this date next.",
+        "message": f"ESSL day-wise attendance stored for {resolved_date.isoformat() if resolved_date else 'unknown date'}. Run reconciliation for this date next.",
         "upload_log_id": upload_log_id
     }
-
-# ============================================================================
-# RECONCILIATION ENDPOINTS
-# ============================================================================
 
 def _get_essl_status(essl_record) -> Optional[str]:
     """FIX v3.2: Extract ESSL status from record (new status column or raw_punches fallback)."""
