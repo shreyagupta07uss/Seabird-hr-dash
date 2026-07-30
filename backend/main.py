@@ -2784,6 +2784,47 @@ def _parse_essl_sheet_flat(raw_rows: List[List[Any]]) -> List[Tuple[str, str, da
     return records
 
 
+def _merge_essl_records(records: List[tuple]) -> List[tuple]:
+    """FIX v3.2.11: ESSL workbooks commonly store 'In' and 'Out' as SEPARATE sheets
+    (e.g. '28 In' and '28 Out'). Each sheet is parsed independently by _parse_essl_sheet,
+    so the same employee+date produces TWO separate partial records — one with only
+    in_time set, one with only out_time set. Left unmerged, both get inserted as
+    distinct ESSLAttendance rows for the same (pr_number, date), so essl_map lookups
+    downstream non-deterministically pick one or the other - silently losing either
+    the in-punch or the out-punch and making has_essl_punches unreliable. This merges
+    same-key (emp_code, date) records into one before they ever reach the DB."""
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    order: List[Tuple[str, str]] = []
+    for emp_code, emp_name, shift, date_key, in_time, out_time, essl_status, raw_punches in records:
+        key = (emp_code, date_key)
+        if key not in merged:
+            merged[key] = {
+                "emp_code": emp_code, "emp_name": emp_name, "shift": shift, "date_key": date_key,
+                "in_time": in_time, "out_time": out_time, "essl_status": essl_status,
+                "raw_punches": dict(raw_punches) if raw_punches else {},
+            }
+            order.append(key)
+        else:
+            m = merged[key]
+            if not m["in_time"] and in_time:
+                m["in_time"] = in_time
+            if not m["out_time"] and out_time:
+                m["out_time"] = out_time
+            if emp_name and not m["emp_name"]:
+                m["emp_name"] = emp_name
+            if shift and (not m["shift"] or m["shift"] == "G"):
+                m["shift"] = shift
+            if not m["essl_status"] and essl_status:
+                m["essl_status"] = essl_status
+            if raw_punches:
+                m["raw_punches"].update(raw_punches)
+    return [
+        (merged[k]["emp_code"], merged[k]["emp_name"], merged[k]["shift"], merged[k]["date_key"],
+         merged[k]["in_time"], merged[k]["out_time"], merged[k]["essl_status"], merged[k]["raw_punches"])
+        for k in order
+    ]
+
+
 @app.post("/api/v1/upload/essl")
 def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
     import time as time_module
@@ -2848,6 +2889,10 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
                 all_dates.add(att_date)
             flat_sheets_processed += 1
     wb.close()
+
+    # FIX v3.2.11: merge partial In-only / Out-only records for the same employee+date
+    # (see _merge_essl_records docstring) BEFORE any insert/update decisions are made.
+    all_records = _merge_essl_records(all_records)
 
     # FLAT FORMAT FALLBACK: no cross-tab sheets found in any worksheet
     if not all_records:
