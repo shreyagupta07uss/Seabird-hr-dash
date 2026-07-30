@@ -83,6 +83,8 @@ export default function UploadCenter() {
     const [deletingId, setDeletingId] = useState<number | null>(null);
     const [deletingAll, setDeletingAll] = useState(false);
     const [targetDate, setTargetDate] = useState<string>("");
+    const [targetYear, setTargetYear] = useState<string>("");
+    const [targetMonth, setTargetMonth] = useState<string>("");
 
     const loadHistory = async () => {
         try {
@@ -113,6 +115,11 @@ export default function UploadCenter() {
                 case 'daywise': result = await api.uploadDaywise(file); break;
                 case 'tata_daily': result = await api.uploadTataDaily(file, targetDate || undefined); break;
                 case 'essl_daywise': result = await api.uploadEsslDaywise(file); break;
+                case 'essl_monthly_status': result = await api.uploadEsslMonthlyStatus(
+                    file,
+                    targetYear ? parseInt(targetYear) : undefined,
+                    targetMonth ? parseInt(targetMonth) : undefined
+                ); break;
                 default: throw new Error(`Unknown upload type: ${type}`);
             }
             setLastResult(result);
@@ -170,6 +177,7 @@ export default function UploadCenter() {
         { type: 'daywise', title: 'Day-wise (ESSL + Tata)', description: "One day's combined workbook - 'Essl In', 'Essl Out', and 'Tata' sheets in a single file. Date is auto-detected.", icon: CalendarDays },
         { type: 'tata_daily', title: 'Tata Daily (Single Sheet)', description: "Single-sheet daily Tata export (e.g. '28th TATA'). Pass target date if the Date column is missing.", icon: Table },
         { type: 'essl_daywise', title: 'ESSL Daywise (In/Out)', description: "Single-day ESSL export with 'Essl In' and/or 'Essl Out' sheets. Date is auto-detected from headers.", icon: FileText },
+        { type: 'essl_monthly_status', title: 'ESSL Monthly Status', description: "Monthly Status Report (Basic Work Duration) - cross-tab with 'Days | 28 T | 29 W' headers and employee blocks per department.", icon: FileText },
         { type: 'master', title: 'Master Data', description: 'Employee roster (PR, Bio, WC/BC, Vendor, Store, Designation)', icon: Database },
         { type: 'essl', title: 'ESSL Biometric (Monthly)', description: 'Raw biometric punches from ESSL machine (cross-tab format, multi-sheet)', icon: FileText },
         { type: 'tata', title: 'Tata Monthly', description: 'Official monthly attendance from Tata - reads every sheet (one per day)', icon: Table },
@@ -182,6 +190,7 @@ export default function UploadCenter() {
     const isDaywiseResult = lastResult?.type === 'daywise';
     const isTataDailyResult = lastResult?.type === 'tata_daily';
     const isEsslDaywiseResult = lastResult?.type === 'essl_daywise';
+    const isEsslMonthlyStatusResult = lastResult?.type === 'essl_monthly_status';
 
     return (
         <div className="space-y-6 fade-in">
@@ -204,6 +213,42 @@ export default function UploadCenter() {
                             />
                             <p className="text-xs text-slate-500 mt-1">
                                 If the Excel file's Date column is missing or unreliable, set this to force the date (e.g. 2026-07-28).
+                            </p>
+                        </div>
+                    </div>
+                </Card>
+            )}
+
+            {uploadingType === 'essl_monthly_status' && (
+                <Card className="p-4 mb-4 border-blue-200 bg-blue-50">
+                    <div className="flex items-center gap-3">
+                        <CalendarDays className="text-blue-600 shrink-0" size={18} />
+                        <div className="flex-1">
+                            <label className="block text-xs font-semibold text-slate-700 mb-1">
+                                Year & Month (optional)
+                            </label>
+                            <div className="flex gap-2">
+                                <input
+                                    type="number"
+                                    value={targetYear}
+                                    onChange={(e) => setTargetYear(e.target.value)}
+                                    className="w-28 px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    placeholder="2026"
+                                    min="2000"
+                                    max="2100"
+                                />
+                                <input
+                                    type="number"
+                                    value={targetMonth}
+                                    onChange={(e) => setTargetMonth(e.target.value)}
+                                    className="w-24 px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    placeholder="7"
+                                    min="1"
+                                    max="12"
+                                />
+                            </div>
+                            <p className="text-xs text-slate-500 mt-1">
+                                Only needed if the title row (e.g. "Jul 28 2026 To Jul 29 2026") is missing or unreadable. Otherwise year/month is auto-detected.
                             </p>
                         </div>
                     </div>
@@ -286,7 +331,34 @@ export default function UploadCenter() {
                 </Card>
             )}
 
-            {lastResult && !isDaywiseResult && !isTataDailyResult && !isEsslDaywiseResult && (
+            {lastResult && isEsslMonthlyStatusResult && (
+                <Card className="p-4 flex items-start gap-3 border-emerald-200 bg-emerald-50">
+                    <CheckCircle2 className="text-emerald-600 shrink-0 mt-0.5" size={18} />
+                    <div className="text-sm w-full">
+                        <p className="font-semibold text-slate-800">
+                            {lastResult.filename}: {lastResult.rows_processed?.toLocaleString()} ESSL rows processed
+                        </p>
+                        {lastResult.employees_found !== undefined && (
+                            <p className="text-xs text-slate-600 mt-0.5">
+                                {lastResult.employees_found} employee(s) found across {lastResult.sheets_parsed} sheet(s).
+                            </p>
+                        )}
+                        {lastResult.date_range && (
+                            <p className="text-xs text-slate-600 mt-0.5">
+                                Date range: {lastResult.date_range}
+                            </p>
+                        )}
+                        {lastResult.dates && (
+                            <p className="text-xs text-slate-600 mt-0.5">
+                                Dates: {lastResult.dates.join(', ')}
+                            </p>
+                        )}
+                        {lastResult.message && <p className="text-xs text-slate-600 mt-0.5">{lastResult.message}</p>}
+                    </div>
+                </Card>
+            )}
+
+            {lastResult && !isDaywiseResult && !isTataDailyResult && !isEsslDaywiseResult && !isEsslMonthlyStatusResult && (
                 <Card className={`p-4 flex items-start gap-3 ${suspiciouslyFewSheets ? 'border-amber-200 bg-amber-50' : 'border-emerald-200 bg-emerald-50'}`}>
                     {suspiciouslyFewSheets ? (
                         <AlertTriangle className="text-amber-600 shrink-0 mt-0.5" size={18} />

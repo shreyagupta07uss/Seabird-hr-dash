@@ -685,6 +685,27 @@ export const api = {
         });
     },
 
+    // NEW: Monthly Status Report (Basic Work Duration) format
+    // Handles cross-tab ESSL exports with "Days | 28 T | 29 W" headers and
+    // employee blocks per department (Status → InTime → OutTime → Total).
+    uploadEsslMonthlyStatus: async (
+        file: File,
+        targetYear?: number,
+        targetMonth?: number,
+        force: boolean = false
+    ): Promise<UploadResult> => {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('force', force.toString());
+        if (targetYear) formData.append('target_year', targetYear.toString());
+        if (targetMonth) formData.append('target_month', targetMonth.toString());
+        return fetchJSON(`${API_BASE}/upload/essl-monthly-status`, {
+            method: 'POST',
+            body: formData,
+            timeout: 600000,
+        });
+    },
+
     runReconciliation: async (target_date: string): Promise<any> => {
         const formData = new FormData();
         formData.append('target_date', target_date);

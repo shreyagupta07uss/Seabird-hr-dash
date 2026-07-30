@@ -1786,6 +1786,199 @@ def get_reports():
 def get_settings():
     return SETTINGS
 
+
+
+def _parse_monthly_status_report(file_bytes: bytes, filename: str = "", target_year: Optional[int] = None, target_month: Optional[int] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse the 'Monthly Status Report (Basic Work Duration)' ESSL export format.
+
+    Structure per sheet:
+      - Title rows: "Monthly Status Report (Basic Work Duration)", "Jul 28 2026 To Jul 29 2026"
+      - Row ~6-7: "Days" | "28 T" | "29 W" | ... (date headers with day+weekday)
+      - Repeating blocks per department:
+        - "Department:" | "A0 Store"
+        - "Emp. Code:" | "PR903106" | ... | "Emp. Name:" | "PRAMOD KAKASAHEB WAGH"
+        - "Status"   | "P"  | "A"  | ...
+        - "InTime"   | "08:33" | "" | ...
+        - "OutTime"  | "17:03" | "" | ...
+        - "Total"    | "8:30" | "00:00" | ...
+
+    Returns (records, debug_info).
+    """
+    wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
+    all_records: List[Dict[str, Any]] = []
+    debug = {"sheets_parsed": 0, "employees_found": 0, "dates_found": [], "issues": []}
+
+    for ws in wb.worksheets:
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows or len(rows) < 10:
+            debug["issues"].append(f"Sheet '{ws.title}': too small ({len(rows)} rows)")
+            continue
+
+        # ── Extract year/month from title rows ──
+        year, month = target_year, target_month
+        if year is None or month is None:
+            for r in rows[:6]:
+                row_text = " ".join(str(c) for c in r if c is not None)
+                # "Jul 28 2026 To Jul 29 2026" or "Jul 2026"
+                m = re.search(r'([A-Za-z]{3,})\\s+\\d{1,2}\\s+(\\d{4})', row_text)
+                if m:
+                    import calendar
+                    mon_str = m.group(1).capitalize()
+                    year = int(m.group(2))
+                    for i, abbr in enumerate(calendar.month_abbr):
+                        if abbr == mon_str:
+                            month = i
+                            break
+                    for i, name in enumerate(calendar.month_name):
+                        if name == mon_str:
+                            month = i
+                            break
+                    break
+
+        # Fallback to filename
+        if year is None or month is None:
+            fn_month = _extract_month_from_filename(filename)
+            if fn_month:
+                year, month = fn_month
+
+        if year is None or month is None:
+            debug["issues"].append(f"Sheet '{ws.title}': could not determine year/month from title or filename")
+            continue
+
+        # ── Find the "Days" header row ──
+        days_row_idx = None
+        date_cols: List[Tuple[int, date]] = []  # (column_index, parsed_date)
+        for i, row in enumerate(rows[:20]):
+            if not row:
+                continue
+            cell0 = str(row[0]).strip().upper() if row[0] is not None else ""
+            if cell0 == "DAYS":
+                days_row_idx = i
+                for j, cell in enumerate(row[1:], start=1):
+                    if cell is None:
+                        continue
+                    s = str(cell).strip()
+                    # Match "28 T", "29 W", "01 M", "1", etc.
+                    dm = re.match(r'(\d{1,2})\s*([A-Za-z.]*)', s)
+                    if dm:
+                        day = int(dm.group(1))
+                        try:
+                            d = date(year, month, day)
+                            date_cols.append((j, d))
+                        except ValueError:
+                            pass
+                break
+
+        if not date_cols:
+            debug["issues"].append(f"Sheet '{ws.title}': no 'Days' row with date columns found")
+            continue
+
+        debug["dates_found"].extend([d.isoformat() for _, d in date_cols])
+        current_department = ""
+
+        # ── Scan for employee blocks ──
+        i = (days_row_idx + 1) if days_row_idx is not None else 0
+        while i < len(rows):
+            row = rows[i]
+            if not row or len(row) < 2:
+                i += 1
+                continue
+
+            cell0 = str(row[0]).strip() if row[0] is not None else ""
+
+            # Department row
+            if cell0 == "Department:":
+                current_department = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                i += 1
+                continue
+
+            # Employee header row: "Emp. Code:" | code | ... | "Emp. Name:" | name
+            if cell0 == "Emp. Code:":
+                emp_code = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                emp_name = ""
+
+                # Look for "Emp. Name:" label anywhere in this row
+                for j in range(2, len(row)):
+                    if str(row[j]).strip() == "Emp. Name:" and j + 1 < len(row) and row[j + 1] is not None:
+                        emp_name = str(row[j + 1]).strip()
+                        break
+
+                # Fallback: scan for a long name-like string
+                if not emp_name:
+                    for j in range(2, len(row)):
+                        val = str(row[j]).strip() if row[j] is not None else ""
+                        if len(val) > 5 and ' ' in val and val.upper() not in ["EMP. NAME:", "EMP. CODE:"]:
+                            emp_name = val
+                            break
+
+                # Read the 4-5 sub-rows: Status, InTime, OutTime, Total
+                status_row = rows[i + 1] if i + 1 < len(rows) else None
+                intime_row = rows[i + 2] if i + 2 < len(rows) else None
+                outtime_row = rows[i + 3] if i + 3 < len(rows) else None
+                total_row = rows[i + 4] if i + 4 < len(rows) else None
+
+                # Safety: verify these are actually the expected sub-rows
+                if status_row and str(status_row[0]).strip().upper() != "STATUS":
+                    status_row = None
+                if intime_row and str(intime_row[0]).strip().upper() != "INTIME":
+                    intime_row = None
+                if outtime_row and str(outtime_row[0]).strip().upper() != "OUTTIME":
+                    outtime_row = None
+                if total_row and str(total_row[0]).strip().upper() != "TOTAL":
+                    total_row = None
+
+                for col_idx, att_date in date_cols:
+                    status_val = None
+                    in_time = None
+                    out_time = None
+                    total_hrs = None
+
+                    if status_row and col_idx < len(status_row) and status_row[col_idx] is not None:
+                        status_val = str(status_row[col_idx]).strip().upper()
+
+                    if intime_row and col_idx < len(intime_row) and intime_row[col_idx] is not None:
+                        in_time = parse_time_br(intime_row[col_idx])
+
+                    if outtime_row and col_idx < len(outtime_row) and outtime_row[col_idx] is not None:
+                        out_time = parse_time_br(outtime_row[col_idx])
+
+                    if total_row and col_idx < len(total_row) and total_row[col_idx] is not None:
+                        total_hrs = str(total_row[col_idx]).strip()
+
+                    # Map status to ESSL markers
+                    essl_status = None
+                    if status_val and status_val in ESSL_STATUS_MARKERS:
+                        essl_status = status_val
+                    elif status_val == "P":
+                        essl_status = "P"
+                    elif status_val == "A":
+                        essl_status = "A"
+                    elif status_val == "½P":
+                        essl_status = "HD"
+
+                    all_records.append({
+                        "emp_code": emp_code,
+                        "emp_name": emp_name,
+                        "date": att_date,
+                        "in_time": in_time,
+                        "out_time": out_time,
+                        "status": essl_status,
+                        "total_hours": total_hrs,
+                        "department": current_department,
+                        "sheet": ws.title,
+                    })
+
+                debug["employees_found"] += 1
+                i += 5  # Skip past Status, InTime, OutTime, Total rows
+                continue
+
+            i += 1
+
+        debug["sheets_parsed"] += 1
+
+    wb.close()
+    return all_records, debug
+
 # ============================================================================
 # UPLOAD ENDPOINTS
 # ============================================================================
@@ -2729,7 +2922,7 @@ def _find_essl_header_row(raw_rows: List[List[Any]], filename_month: Optional[Tu
                     full_dates.append((j, parsed))
         if full_dates:
             date_col_idxs = {d[0] for d in full_dates}
-            if len(full_dates) >= 3 or _essl_header_label_hits(row, date_col_idxs) >= 2:
+            if len(full_dates) >= 2 or _essl_header_label_hits(row, date_col_idxs) >= 1:
                 return {
                     "row_idx": i,
                     "date_cols": full_dates,
@@ -2747,7 +2940,7 @@ def _find_essl_header_row(raw_rows: List[List[Any]], filename_month: Optional[Tu
                         day_dates.append((j, parsed))
             if day_dates:
                 date_col_idxs = {d[0] for d in day_dates}
-                if len(day_dates) >= 3 or _essl_header_label_hits(row, date_col_idxs) >= 2:
+                if len(day_dates) >= 2 or _essl_header_label_hits(row, date_col_idxs) >= 1:
                     return {
                         "row_idx": i,
                         "date_cols": day_dates,
@@ -2778,12 +2971,17 @@ def _identify_essl_columns(header_row: List[Any], meta_cols: List[int], raw_rows
 
     # Fallback: detect from data patterns
     if emp_code_col is None:
-        for j in meta_cols:
+        # Scan ALL columns (including date columns) for emp_code - in this format
+        # the code may appear in what looks like a date column because the header
+        # says "Emp. Code:" in col 0 and the actual code is in col 1.
+        for j in range(len(header_row)):
+            if j == emp_name_col:
+                continue
             codes = 0
             for r in raw_rows[header_idx+1:header_idx+25]:
                 if j < len(r) and r[j] is not None:
                     v = str(r[j]).strip()
-                    if re.match(r'^[A-Z0-9\-]+$', v) and len(v) >= 3 and v not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME"]:
+                    if re.match(r'^[A-Za-z0-9\-_]+$', v) and len(v) >= 3 and v.upper() not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME", "DAYS", "EMP. CODE:", "EMP. NAME:"]:
                         codes += 1
             if codes >= 2:
                 emp_code_col = j
@@ -2930,7 +3128,7 @@ def _parse_essl_sheet(raw_rows: List[List[Any]], sheet_name: str = "",
             if val is not None:
                 v = str(val).strip()
                 if v and v not in ["", "-", "#N/A", "N/A"]:
-                    if re.match(r'^[A-Z0-9\-]+$', v) and len(v) >= 3 and v not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME"]:
+                    if re.match(r'^[A-Za-z0-9\-_]+$', v) and len(v) >= 3 and v.upper() not in ["IN", "OUT", "TOTAL", "OT", "STATUS", "REMARKS", "REMARK", "SHIFT", "SFT", "INTIME", "OUTTIME"]:
                         has_emp_code = True
                         emp_code = v
 
@@ -4302,6 +4500,171 @@ def upload_essl_daywise(file: UploadFile = File(...), target_date: Optional[str]
         "filename": file.filename,
         "message": f"ESSL day-wise attendance stored for {resolved_date.isoformat() if resolved_date else 'unknown date'}. Run reconciliation for this date next.",
         "upload_log_id": upload_log_id
+    }
+
+
+@app.post("/api/v1/upload/essl-monthly-status")
+def upload_essl_monthly_status(
+    file: UploadFile = File(...),
+    target_year: Optional[int] = Form(None),
+    target_month: Optional[int] = Form(None),
+    force: bool = Form(False),
+    db: Session = Depends(get_db)
+):
+    """Upload ESSL 'Monthly Status Report (Basic Work Duration)' format.
+
+    This handles the exact format shown in ESSL exports where:
+      - Each sheet = one company unit (e.g. Sheet1=PUNE NEW 4, Sheet2=TML-Offroll, Sheet3=TML-Onroll)
+      - Header row: "Days" | "28 T" | "29 W" | ...
+      - Employee blocks: Emp. Code → Status → InTime → OutTime → Total (per date column)
+
+    Pass target_year + target_month (e.g. 2026, 7) if the title row is missing/unreliable.
+    """
+    import time as time_module
+    start_time = time_module.time()
+
+    contents = file.file.read()
+    file_hash = hashlib.sha256(contents).hexdigest()
+    if not force:
+        existing = db.query(UploadLog).filter(UploadLog.file_hash == file_hash).first()
+        if existing:
+            return {"status": "duplicate", "message": "Already uploaded", "previous_id": existing.id}
+
+    # Parse the file
+    try:
+        records, debug = _parse_monthly_status_report(
+            contents, filename=file.filename,
+            target_year=target_year, target_month=target_month
+        )
+    except Exception as e:
+        db.add(UploadLog(
+            file_type="essl_monthly_status", filename=file.filename, file_hash=file_hash,
+            rows_processed=0, status="Failed", error_message=str(e)
+        ))
+        db.commit()
+        raise HTTPException(status_code=400, detail=f"Failed to parse report: {str(e)}")
+
+    if not records:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No records extracted. Debug: {debug}. "
+                   f"If year/month detection failed, pass target_year + target_month explicitly."
+        )
+
+    # Prefetch employees
+    all_employees = db.query(Employee).all()
+    emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
+    emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
+    emp_by_name = _build_unique_name_index(all_employees)
+
+    def resolve_emp(code_val: str, name_val: str):
+        e = emp_by_pr.get(code_val)
+        if e:
+            return e
+        e = emp_by_code.get(code_val)
+        if e:
+            return e
+        if name_val:
+            return emp_by_name.get(name_val.strip().upper())
+        return None
+
+    # Bulk-fetch existing ESSL rows for the date range
+    all_dates = {r["date"] for r in records}
+    min_date, max_date = min(all_dates), max(all_dates)
+    existing_keys = set()
+    for pr, dt in db.query(ESSLAttendance.pr_number, ESSLAttendance.date).filter(
+        ESSLAttendance.date >= min_date, ESSLAttendance.date <= max_date
+    ).all():
+        existing_keys.add((pr, dt.isoformat()))
+
+    upload_log = UploadLog(
+        file_type="essl_monthly_status", filename=file.filename, file_hash=file_hash,
+        rows_processed=0, status="Processing"
+    )
+    db.add(upload_log)
+    db.flush()
+    upload_log_id = upload_log.id
+
+    to_insert = []
+    to_update = []
+    processed = 0
+
+    for rec in records:
+        emp = resolve_emp(rec["emp_code"], rec["emp_name"])
+        pr_number = emp.pr_number if emp else rec["emp_code"]
+        if emp and not emp.emp_code:
+            emp.emp_code = rec["emp_code"]
+            emp_by_code[rec["emp_code"]] = emp
+
+        date_key = rec["date"].isoformat()
+        key = (pr_number, date_key)
+
+        raw_punches = {}
+        if rec["total_hours"]:
+            raw_punches["total_hours"] = rec["total_hours"]
+        if rec["department"]:
+            raw_punches["department"] = rec["department"]
+
+        if key in existing_keys:
+            to_update.append({
+                "pr_number": pr_number,
+                "date": rec["date"],
+                "in_time": rec["in_time"],
+                "out_time": rec["out_time"],
+                "status": rec["status"],
+                "raw_punches": json.dumps(raw_punches) if raw_punches else None,
+            })
+        else:
+            to_insert.append({
+                "employee_id": emp.id if emp else None,
+                "pr_number": pr_number,
+                "emp_code": rec["emp_code"],
+                "emp_name": rec["emp_name"],
+                "date": rec["date"],
+                "in_time": rec["in_time"],
+                "out_time": rec["out_time"],
+                "status": rec["status"],
+                "raw_punches": json.dumps(raw_punches) if raw_punches else None,
+                "vendor": emp.vendor if emp else "",
+                "store": emp.store if emp else "",
+                "department": rec["department"] or (emp.department if emp else ""),
+                "shift": safe_shift(emp.shift) if emp else "G",
+                "upload_log_id": upload_log_id,
+            })
+        processed += 1
+
+    if to_insert:
+        db.execute(ESSLAttendance.__table__.insert(), to_insert)
+    for upd in to_update:
+        db.query(ESSLAttendance).filter(
+            ESSLAttendance.pr_number == upd["pr_number"],
+            ESSLAttendance.date == upd["date"]
+        ).update({
+            ESSLAttendance.in_time: upd["in_time"] or ESSLAttendance.in_time,
+            ESSLAttendance.out_time: upd["out_time"] or ESSLAttendance.out_time,
+            ESSLAttendance.status: upd["status"] or ESSLAttendance.status,
+            ESSLAttendance.raw_punches: upd["raw_punches"] or ESSLAttendance.raw_punches,
+            ESSLAttendance.upload_log_id: upload_log_id,
+        }, synchronize_session=False)
+
+    upload_log.status = "Success"
+    upload_log.rows_processed = processed
+    db.commit()
+    elapsed = round(time_module.time() - start_time, 2)
+
+    return {
+        "status": "success",
+        "type": "essl_monthly_status",
+        "rows_processed": processed,
+        "employees_found": debug["employees_found"],
+        "sheets_parsed": debug["sheets_parsed"],
+        "date_range": f"{min_date.isoformat()} to {max_date.isoformat()}",
+        "dates": sorted({d.isoformat() for d in all_dates}),
+        "elapsed_seconds": elapsed,
+        "filename": file.filename,
+        "upload_log_id": upload_log_id,
+        "debug": debug,
+        "message": "Monthly Status Report parsed and stored. Run reconciliation for the affected dates.",
     }
 
 def _get_essl_status(essl_record) -> Optional[str]:
