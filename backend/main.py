@@ -55,7 +55,7 @@ from datetime import datetime, date, timedelta, time
 import json
 import csv
 import io
-from io import BytesIO as bio
+from io import BytesIO
 import os
 import re
 import hashlib
@@ -496,6 +496,15 @@ app = FastAPI(
     title="SeaBird HR Analytics API",
     description="HR Analytics backend for SeaBird x Tata Motors workforce",
     version="3.2.8-MERGED"
+)
+
+# Standard CORS middleware - handles preflight and all origins properly
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # CORS - DYNAMIC: reflect any origin (internal tool - no hardcoded URLs needed)
@@ -2314,7 +2323,6 @@ def _parse_tata_rows_with_header(raw_rows: List[List[Any]], header_info: Dict[st
     return parsed
 
 @app.post("/api/v1/upload/tata-daily")
-
 def upload_tata_daily(file: UploadFile = File(...), target_date: Optional[str] = Form(None), force: bool = Form(False), db: Session = Depends(get_db)):
     """Single-sheet daily Tata upload — optimized for one-day exports like '28th TATA'.
     Pass target_date (DD/MM/YYYY or YYYY-MM-DD) to override the Date column if missing/unreliable."""
@@ -6226,7 +6234,7 @@ def download_ot_report(month: Optional[str] = Query(None), vendor: Optional[str]
     if store: q = q.filter(Employee.store == store)
     records = q.order_by(Overtime.date.desc(), Overtime.pr_number).limit(50000).all()
 
-    output = bio.StringIO()
+    output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["PR", "Name", "Store", "Date", "Worked Hours", "OT Hours", "OT Headcount", "Status", "Approved By"])
     for r in records:
@@ -6248,7 +6256,7 @@ def download_late_report(month: Optional[str] = Query(None), vendor: Optional[st
     if store: q = q.filter(Employee.store == store)
     records = q.order_by(Attendance.date.desc(), Attendance.pr_number).limit(50000).all()
 
-    output = bio.StringIO()
+    output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["PR", "Name", "Store", "Date", "Shift", "Final In", "Late Minutes"])
     for r in records:
@@ -6264,7 +6272,7 @@ def download_monthly_report(month: Optional[str] = Query(None), db: Session = De
     # Validate the month format even though we only use it for string comparison
     parse_year_month(ym)
     records = db.query(MonthlyTataAttendance).filter(MonthlyTataAttendance.year_month == ym).order_by(MonthlyTataAttendance.pr_number).all()
-    output = bio.StringIO()
+    output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["PR", "Name", "Month", "Total Days", "Present", "Absent", "Leave", "Week Off", "Half Day", "Attendance %", "Total OT Hours"])
     for r in records:
