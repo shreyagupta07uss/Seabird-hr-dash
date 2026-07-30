@@ -2825,6 +2825,26 @@ def _merge_essl_records(records: List[tuple]) -> List[tuple]:
     ]
 
 
+def _build_unique_name_index(employees) -> Dict[str, Any]:
+    """FIX v3.2.11: Build a name -> Employee lookup for the name-fallback matching used
+    when a raw file's code doesn't hit a known pr_number/emp_code. A plain dict silently
+    lets the LAST employee with a given name win, so if two+ different people share a
+    name (very common at plant scale - e.g. multiple 'VIPIN KUMAR's each with their own
+    ESSL code), every one of them gets silently merged onto whichever employee happened
+    to be inserted last. That corrupts both people's attendance. This only indexes names
+    that map to exactly ONE employee, so ambiguous names are simply not name-matched at
+    all (they still resolve fine if their code matches directly)."""
+    counts: Dict[str, int] = {}
+    by_name: Dict[str, Any] = {}
+    for e in employees:
+        if not e.name:
+            continue
+        key = e.name.strip().upper()
+        counts[key] = counts.get(key, 0) + 1
+        by_name[key] = e
+    return {name: emp for name, emp in by_name.items() if counts[name] == 1}
+
+
 @app.post("/api/v1/upload/essl")
 def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Session = Depends(get_db)):
     import time as time_module
@@ -2848,20 +2868,22 @@ def upload_essl(file: UploadFile = File(...), force: bool = Form(False), db: Ses
 
     all_employees = db.query(Employee).all()
     emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
-    emp_by_name = {}
-    for e in all_employees:
-        if e.name:
-            emp_by_name[e.name.strip().upper()] = e
     emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
 
+    # FIX v3.2.11: NO name-fallback here. Per this module's own architecture notes,
+    # ESSL's "EMP Code" column IS the PayCode/PR for genuine SeaBird staff - so a code
+    # match is the only trustworthy signal. ESSL_All-style exports are plant-wide
+    # (thousands of people from other contractors/companies), and name collisions are
+    # common at that scale (e.g. multiple different "VIPIN KUMAR"s or "ASHISH KUMAR"s).
+    # Falling back to name matching here - even against a name that's unique within
+    # SeaBird's own roster - would silently attribute a stranger's punches to whichever
+    # SeaBird employee happens to share that name, corrupting their attendance. Rows
+    # whose code isn't a known pr_number/emp_code simply don't belong to SeaBird and
+    # are left unmatched (employee_id=None), exactly as this module's docstring intends.
     def resolve_employee_fast(emp_code_val: str, emp_name_val: str):
         e = emp_by_pr.get(emp_code_val)
         if e:
             return e
-        if emp_name_val:
-            e = emp_by_name.get(emp_name_val.strip().upper())
-            if e:
-                return e
         return emp_by_code.get(emp_code_val)
 
     # Process ALL sheets — accumulate cross-tab records from every sheet that has one,
@@ -3186,7 +3208,8 @@ def upload_tata(file: UploadFile = File(...), force: bool = Form(False), db: Ses
     all_employees = db.query(Employee).all()
     emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
     emp_by_code = {e.emp_code: e for e in all_employees if e.emp_code}
-    emp_by_name = {e.name.strip().upper(): e for e in all_employees if e.name}
+    # FIX v3.2.11: ambiguity-safe name index - see _build_unique_name_index docstring.
+    emp_by_name = _build_unique_name_index(all_employees)
 
     def resolve_employee_fast(paycode: str, emp_name_val: str):
         e = emp_by_pr.get(paycode)
@@ -3490,7 +3513,8 @@ def upload_daywise(file: UploadFile = File(...), target_date: Optional[str] = Fo
 
     all_employees = db.query(Employee).all()
     emp_by_pr = {e.pr_number: e for e in all_employees if e.pr_number}
-    emp_by_name = {e.name.strip().upper(): e for e in all_employees if e.name}
+    # FIX v3.2.11: ambiguity-safe name index - see _build_unique_name_index docstring.
+    emp_by_name = _build_unique_name_index(all_employees)
 
     def resolve_emp(code_val: Optional[str], name_val: Optional[str]):
         if code_val and code_val in emp_by_pr:
