@@ -556,7 +556,7 @@ async def dynamic_cors_middleware(request, call_next):
 @app.get("/api/v1/health")
 def health_check():
     """Returns ok. Use this to verify backend is alive and CORS headers are present."""
-    return {"status": "ok", "version": "3.2.10-OT", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ok", "version": "3.2.12", "timestamp": datetime.utcnow().isoformat()}
 
 
 
@@ -3948,6 +3948,13 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
             display_status = "Present"
             attendance_status = "P"
 
+        # FIX v3.2.12: Sunday with no actual punches and no Tata record = Week Off, not Absent
+        if is_sunday and not has_any_punches and not tata and display_status not in ["Week Off", "Leave"]:
+            display_status = "Week Off"
+            attendance_status = "WO"
+            match_status = "Week Off"
+            remark = "Sunday - Week Off"
+
         # FIX v3.2.4: Status stays "Present" for Late Punch, Early Departure, etc.
         # The Issue column captures the specific problem. Only Present/Absent as main status.
         # FIX v3.2.10: Override to Half Day if worked hours <= threshold
@@ -4473,6 +4480,13 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                 if is_sunday and tata:
                     display_status = "Present"
                     attendance_status = "P"
+
+                # FIX v3.2.12: Sunday with no actual punches and no Tata record = Week Off, not Absent
+                if is_sunday and not has_any_punches and not tata and display_status not in ["Week Off", "Leave"]:
+                    display_status = "Week Off"
+                    attendance_status = "WO"
+                    match_status = "Week Off"
+                    remark = "Sunday - Week Off"
 
                 # FIX v3.2.4: Status stays "Present" for Late Punch, Early Departure, etc.
                 # The Issue column captures the specific problem. Only Present/Absent as main status.
