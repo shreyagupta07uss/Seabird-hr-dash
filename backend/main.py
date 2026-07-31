@@ -4855,10 +4855,89 @@ def _get_essl_status(essl_record) -> Optional[str]:
             pass
     return None
 
+def _auto_provision_missing_employees(start: date, end: date, db: Session) -> int:
+    """
+    GAP FIX: ESSL and Tata uploads routinely contain pr_numbers that were never
+    added to the Employee/Master table (new joiners, vendor onboarding lag, master
+    file not yet updated, etc). Previously these employees were completely invisible
+    to reconciliation - not even marked Absent, just silently skipped - because both
+    _reconcile_single_date and _run_reconciliation_month_core only ever loop over
+    `db.query(Employee)`. On a single date this let dozens of real, worked days go
+    uncounted (confirmed against a real Master/ESSL/Tata/official-dump comparison:
+    47 pr_numbers present in the official dump had zero Employee row at all, 35 of
+    them with real worked hours that day).
+
+    This scans ESSL/Tata rows in [start, end) for any pr_number with no matching
+    Employee record and creates a minimal ACTIVE Employee row for it (name/vendor/
+    store/shift/department pulled from whichever source has them, Tata preferred
+    since it tends to carry more complete data). Each is tagged via `designation`
+    so HR/admin can find and complete them with real Master data later.
+    Reconciliation runs correctly on them in the meantime the same way it does for
+    any employee with incomplete master data (falls back to shift "G", category
+    "BC" per the existing `emp.shift or "G"` / `emp.wc or "BC"` logic).
+
+    Returns the number of employees created.
+    """
+    existing_prs = {r[0] for r in db.query(Employee.pr_number).all() if r[0]}
+
+    tata_rows = db.query(
+        TataAttendance.pr_number, TataAttendance.emp_name, TataAttendance.vendor,
+        TataAttendance.store, TataAttendance.department, TataAttendance.shift, TataAttendance.emp_code
+    ).filter(TataAttendance.date >= start, TataAttendance.date < end).all()
+
+    essl_rows = db.query(
+        ESSLAttendance.pr_number, ESSLAttendance.emp_name, ESSLAttendance.vendor,
+        ESSLAttendance.store, ESSLAttendance.shift, ESSLAttendance.emp_code
+    ).filter(ESSLAttendance.date >= start, ESSLAttendance.date < end).all()
+
+    # Build a pr_number -> best-available-details map. ESSL fills it in first,
+    # Tata values then win wherever Tata actually has a non-null value (Tata is
+    # generally the more complete source) without blanking out an ESSL value.
+    details: Dict[str, Dict[str, Any]] = {}
+    for pr, name, vendor, store, shift, emp_code in essl_rows:
+        if not pr or pr in existing_prs:
+            continue
+        details.setdefault(pr, {}).update({
+            "name": name, "vendor": vendor, "store": store, "shift": shift, "emp_code": emp_code
+        })
+    for pr, name, vendor, store, department, shift, emp_code in tata_rows:
+        if not pr or pr in existing_prs:
+            continue
+        entry = details.setdefault(pr, {})
+        entry.update({k: v for k, v in {
+            "name": name, "vendor": vendor, "store": store, "department": department,
+            "shift": shift, "emp_code": emp_code
+        }.items() if v})
+
+    created = 0
+    for pr, info in details.items():
+        if pr in existing_prs:
+            continue
+        db.add(Employee(
+            pr_number=pr,
+            emp_code=info.get("emp_code"),
+            name=info.get("name") or pr,
+            vendor=info.get("vendor"),
+            store=info.get("store"),
+            department=info.get("department"),
+            shift=info.get("shift"),
+            wc=None,
+            status="ACTIVE",
+            designation="AUTO-PROVISIONED - verify in Master",
+        ))
+        existing_prs.add(pr)
+        created += 1
+
+    if created:
+        db.flush()
+    return created
+
 def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
     """
     Core reconciliation logic for one date. FIX v3.2: Uses batched queries for performance.
     """
+    _auto_provision_missing_employees(d, d + timedelta(days=1), db)
+
     employees = db.query(Employee).filter(Employee.status == "ACTIVE").all()
     emp_ids = [e.id for e in employees]
     emp_by_id = {e.id: e for e in employees}
@@ -5368,6 +5447,8 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
     total_days_in_month = (end - start).days
 
     _set_job_stage(job_id, "prefetching employee data")
+
+    _auto_provision_missing_employees(start, end, db)
 
     employees = db.query(Employee).all()
     emp_ids = [e.id for e in employees]
