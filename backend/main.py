@@ -1209,7 +1209,11 @@ def get_kpis(target_date: str = Query(...), db: Session = Depends(get_db)):
     if not today:
         raise HTTPException(status_code=400, detail="Invalid target_date format. Use YYYY-MM-DD.")
 
-    total_employees = db.query(Employee).count()  # FIX v3.2.8: Count ALL master employees
+    # FIX v3.2.11: Count only ACTIVE employees. Counting ALL rows (previous
+    # "FIX v3.2.8") silently included every AUTO-PROVISIONED / left / transferred
+    # employee ever created by an ESSL/Tata upload, inflating headcount well past
+    # the true Master roster (e.g. showed ~1500 when Master had 1199 rows).
+    total_employees = db.query(Employee).filter(Employee.status == "ACTIVE").count()
 
     # PERF FIX: joinedload eager-loads employee in the same query. Previously,
     # a.employee below triggered a separate SELECT per attendance row (N+1) -
@@ -1725,7 +1729,7 @@ def get_vendors(db: Session = Depends(get_db)):
     result = []
     for (v,) in vendors:
         if not v: continue
-        total = db.query(Employee).filter(Employee.vendor == v).count()  # FIX v3.2.8: All employees
+        total = db.query(Employee).filter(Employee.vendor == v, Employee.status == "ACTIVE").count()  # FIX v3.2.11: ACTIVE only
         vendor_attendance = db.query(Attendance).join(Employee).filter(
             Employee.vendor == v, Attendance.date == today
         ).all()
@@ -1741,7 +1745,7 @@ def get_stores(db: Session = Depends(get_db)):
     result = []
     for (s,) in stores:
         if not s: continue
-        total = db.query(Employee).filter(Employee.store == s).count()  # FIX v3.2.8: All employees
+        total = db.query(Employee).filter(Employee.store == s, Employee.status == "ACTIVE").count()  # FIX v3.2.11: ACTIVE only
         store_attendance = db.query(Attendance).join(Employee).filter(
             Employee.store == s, Attendance.date == today
         ).all()
@@ -1757,7 +1761,7 @@ def get_departments(db: Session = Depends(get_db)):
     result = []
     for (d,) in depts:
         if not d: continue
-        total = db.query(Employee).filter(Employee.department == d).count()  # FIX v3.2.8: All employees
+        total = db.query(Employee).filter(Employee.department == d, Employee.status == "ACTIVE").count()  # FIX v3.2.11: ACTIVE only
         dept_attendance = db.query(Attendance).join(Employee).filter(
             Employee.department == d, Attendance.date == today
         ).all()
@@ -4880,15 +4884,31 @@ def _auto_provision_missing_employees(start: date, end: date, db: Session) -> in
     """
     existing_prs = {r[0] for r in db.query(Employee.pr_number).all() if r[0]}
 
+    # FIX v3.2.11: Require actual evidence of work (a real in_time/out_time, or
+    # man_hrs > 0) before auto-provisioning. Previously ANY row - including a bare
+    # "WO"/"A" placeholder from an unrelated/plant-wide punch machine entry that
+    # happens to share a code - was enough to permanently create an ACTIVE
+    # employee. Over repeated daily uploads this silently accumulated ~300+
+    # phantom "employees" with zero real attendance, inflating total headcount
+    # and every dump/report built by joining Attendance -> Employee.
     tata_rows = db.query(
         TataAttendance.pr_number, TataAttendance.emp_name, TataAttendance.vendor,
         TataAttendance.store, TataAttendance.department, TataAttendance.shift, TataAttendance.emp_code
-    ).filter(TataAttendance.date >= start, TataAttendance.date < end).all()
+    ).filter(
+        TataAttendance.date >= start, TataAttendance.date < end,
+        ((TataAttendance.in_time.isnot(None)) & (TataAttendance.in_time != "")) |
+        ((TataAttendance.out_time.isnot(None)) & (TataAttendance.out_time != "")) |
+        (TataAttendance.man_hrs > 0)
+    ).all()
 
     essl_rows = db.query(
         ESSLAttendance.pr_number, ESSLAttendance.emp_name, ESSLAttendance.vendor,
         ESSLAttendance.store, ESSLAttendance.shift, ESSLAttendance.emp_code
-    ).filter(ESSLAttendance.date >= start, ESSLAttendance.date < end).all()
+    ).filter(
+        ESSLAttendance.date >= start, ESSLAttendance.date < end,
+        ((ESSLAttendance.in_time.isnot(None)) & (ESSLAttendance.in_time != "")) |
+        ((ESSLAttendance.out_time.isnot(None)) & (ESSLAttendance.out_time != ""))
+    ).all()
 
     # Build a pr_number -> best-available-details map. ESSL fills it in first,
     # Tata values then win wherever Tata actually has a non-null value (Tata is
@@ -7838,6 +7858,43 @@ def get_ot_trend_forecast(
 # ADMIN / UTILITY ENDPOINTS
 # Use these to fix corrupted states or clean up stale data.
 # ============================================================================
+
+@app.get("/api/v1/admin/unverified-employees")
+def list_unverified_employees(db: Session = Depends(get_db)):
+    """FIX v3.2.11: List employees that were auto-provisioned from a stray ESSL/Tata
+    punch row rather than coming from an uploaded Master file. These are the phantom
+    records responsible for total_employees / dump reports showing more people than
+    your actual Master roster. Review this list, then call
+    POST /api/v1/admin/purge-unverified-employees to remove the ones that aren't
+    real SeaBird staff (most won't be - they're usually plant-wide/other-contractor
+    codes that happened to collide, or stale WO/Absent placeholder rows)."""
+    rows = db.query(Employee).filter(Employee.designation.like("AUTO-PROVISIONED%")).all()
+    return {
+        "count": len(rows),
+        "employees": [
+            {"id": e.id, "pr_number": e.pr_number, "emp_code": e.emp_code, "name": e.name,
+             "vendor": e.vendor, "store": e.store, "status": e.status}
+            for e in rows
+        ]
+    }
+
+@app.post("/api/v1/admin/purge-unverified-employees")
+def purge_unverified_employees(
+    confirm: bool = Query(False, description="Must be true to actually delete."),
+    db: Session = Depends(get_db)
+):
+    """FIX v3.2.11: Permanently delete all employees still tagged
+    'AUTO-PROVISIONED - verify in Master' - i.e. never confirmed by an actual
+    Master upload. Also removes their attendance/reconciliation history via cascade.
+    Call with confirm=true after reviewing GET /api/v1/admin/unverified-employees."""
+    if not confirm:
+        preview = db.query(Employee).filter(Employee.designation.like("AUTO-PROVISIONED%")).count()
+        return {"status": "dry_run", "would_delete": preview,
+                "message": "Re-call with ?confirm=true to actually delete these employees."}
+    count = db.query(Employee).filter(Employee.designation.like("AUTO-PROVISIONED%")).delete(synchronize_session=False)
+    db.commit()
+    return {"status": "purged", "employees_deleted": count,
+            "message": f"Deleted {count} unverified auto-provisioned employees and their related records."}
 
 @app.post("/api/v1/admin/purge-inactive-employees")
 def purge_inactive_employees(db: Session = Depends(get_db)):
