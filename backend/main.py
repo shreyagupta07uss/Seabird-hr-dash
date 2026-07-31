@@ -1209,11 +1209,19 @@ def get_kpis(target_date: str = Query(...), db: Session = Depends(get_db)):
     if not today:
         raise HTTPException(status_code=400, detail="Invalid target_date format. Use YYYY-MM-DD.")
 
-    # FIX v3.2.11: Count only ACTIVE employees. Counting ALL rows (previous
-    # "FIX v3.2.8") silently included every AUTO-PROVISIONED / left / transferred
-    # employee ever created by an ESSL/Tata upload, inflating headcount well past
-    # the true Master roster (e.g. showed ~1500 when Master had 1199 rows).
-    total_employees = db.query(Employee).filter(Employee.status == "ACTIVE").count()
+    # FIX v3.2.12: Count every employee that actually came from a Master upload,
+    # regardless of status (ACTIVE/INACTIVE/NOT OK/LEFT/blank/etc) - HR treats
+    # Status as informational, not as a filter on whether someone counts as an
+    # employee. The ONLY rows excluded here are ones tagged AUTO-PROVISIONED,
+    # because those were never confirmed by an actual Master file - they were
+    # invented from a stray ESSL/Tata punch row and are the reason headcount
+    # was inflated to ~1500 instead of the true Master count of 1199. Once those
+    # are purged via /api/v1/admin/purge-unverified-employees this will read
+    # exactly len(Master file rows), same as everywhere else in the app that
+    # should show the full roster (not just ACTIVE).
+    total_employees = db.query(Employee).filter(
+        (Employee.designation.is_(None)) | (~Employee.designation.like("AUTO-PROVISIONED%"))
+    ).count()
 
     # PERF FIX: joinedload eager-loads employee in the same query. Previously,
     # a.employee below triggered a separate SELECT per attendance row (N+1) -
@@ -1729,7 +1737,10 @@ def get_vendors(db: Session = Depends(get_db)):
     result = []
     for (v,) in vendors:
         if not v: continue
-        total = db.query(Employee).filter(Employee.vendor == v, Employee.status == "ACTIVE").count()  # FIX v3.2.11: ACTIVE only
+        total = db.query(Employee).filter(  # FIX v3.2.12: all Master employees for this vendor, any status
+            Employee.vendor == v,
+            (Employee.designation.is_(None)) | (~Employee.designation.like("AUTO-PROVISIONED%"))
+        ).count()
         vendor_attendance = db.query(Attendance).join(Employee).filter(
             Employee.vendor == v, Attendance.date == today
         ).all()
@@ -1745,7 +1756,10 @@ def get_stores(db: Session = Depends(get_db)):
     result = []
     for (s,) in stores:
         if not s: continue
-        total = db.query(Employee).filter(Employee.store == s, Employee.status == "ACTIVE").count()  # FIX v3.2.11: ACTIVE only
+        total = db.query(Employee).filter(  # FIX v3.2.12: all Master employees for this store, any status
+            Employee.store == s,
+            (Employee.designation.is_(None)) | (~Employee.designation.like("AUTO-PROVISIONED%"))
+        ).count()
         store_attendance = db.query(Attendance).join(Employee).filter(
             Employee.store == s, Attendance.date == today
         ).all()
@@ -1761,7 +1775,10 @@ def get_departments(db: Session = Depends(get_db)):
     result = []
     for (d,) in depts:
         if not d: continue
-        total = db.query(Employee).filter(Employee.department == d, Employee.status == "ACTIVE").count()  # FIX v3.2.11: ACTIVE only
+        total = db.query(Employee).filter(  # FIX v3.2.12: all Master employees for this department, any status
+            Employee.department == d,
+            (Employee.designation.is_(None)) | (~Employee.designation.like("AUTO-PROVISIONED%"))
+        ).count()
         dept_attendance = db.query(Attendance).join(Employee).filter(
             Employee.department == d, Attendance.date == today
         ).all()
@@ -4958,13 +4975,18 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
     """
     _auto_provision_missing_employees(d, d + timedelta(days=1), db)
 
-    employees = db.query(Employee).filter(Employee.status == "ACTIVE").all()
-    emp_ids = [e.id for e in employees]
-    emp_by_id = {e.id: e for e in employees}
-
-    # FIX v3.2: Pre-fetch ALL related records for this date in bulk queries
-    # FIX v3.2.1: Use pr_number instead of employee_id for reliable matching
-    all_pr_numbers = [e.pr_number for e in employees if e.pr_number]
+    # FIX v3.2.12: Do NOT filter to ACTIVE-only here. Master's Status column is
+    # updated in batches and isn't a reliable real-time signal of whether someone
+    # actually worked a given day - confirmed against a real Master/Tata/dump
+    # comparison: 35 employees marked "NOT OK"/"LEFT" in Master had full Tata
+    # punch records with real worked hours (7-11h) on the reconciliation date,
+    # and were being silently dropped from the dump entirely because of this
+    # filter. The month-level reconciliation (_run_reconciliation_month_core)
+    # already processes every employee with no status filter - this brings
+    # single-date reconciliation in line with that so real attendance is never
+    # thrown away. Master's status label is still shown on each row for HR's
+    # own review; it just no longer gates whether the row is generated at all.
+    employees = db.query(Employee).all()
 
     # TATA-ONLY DETECTION: employees with Tata data but NO ESSL data for this date
     tata_only_prs = set()
