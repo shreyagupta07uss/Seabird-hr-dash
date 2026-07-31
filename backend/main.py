@@ -1788,6 +1788,63 @@ def get_settings():
 
 
 
+class _OpenpyxlSheetAdapter:
+    """Thin wrapper so both readers below expose the same .title / .iter_rows() API."""
+    def __init__(self, ws):
+        self.title = ws.title
+        self._ws = ws
+    def iter_rows(self, values_only=True):
+        return self._ws.iter_rows(values_only=values_only)
+
+
+class _XlrdSheetAdapter:
+    """Makes an xlrd sheet look like an openpyxl worksheet - same .title attribute
+    and .iter_rows(values_only=True) generator, with empty cells normalized to None
+    (xlrd returns '' for blanks; openpyxl returns None) so downstream parsing code
+    doesn't need to know which library actually read the file."""
+    def __init__(self, sheet):
+        self.title = sheet.name
+        self._sheet = sheet
+    def iter_rows(self, values_only=True):
+        for r in range(self._sheet.nrows):
+            row = []
+            for c in range(self._sheet.ncols):
+                v = self._sheet.cell_value(r, c)
+                row.append(v if v not in ("", None) else None)
+            yield tuple(row)
+
+
+def _load_workbook_any(file_bytes: bytes, filename: str = "") -> Tuple[List[Any], Any]:
+    """Load a workbook from either modern .xlsx (openpyxl) or legacy .xls (xlrd)
+    bytes. Returns (sheets, raw_wb_or_None) where `sheets` is a list of adapter
+    objects exposing .title and .iter_rows(values_only=True).
+
+    FIX: ESSL biometric devices export "Monthly Status Report" almost exclusively
+    as legacy .xls (OLE2 format) - openpyxl can only read the modern .xlsx zip
+    format and throws zipfile.BadZipFile on a real .xls file. Without this
+    fallback, every raw ESSL Monthly Status Report upload fails outright, which
+    is why nothing from that file ever reaches reconciliation.
+    """
+    try:
+        wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
+        return [_OpenpyxlSheetAdapter(ws) for ws in wb.worksheets], wb
+    except Exception:
+        pass
+
+    try:
+        import xlrd
+    except ImportError:
+        raise ValueError(
+            "This looks like a legacy .xls file (ESSL's native export format), which "
+            "needs the 'xlrd' package to read and it isn't installed on the server. "
+            "Add xlrd>=2.0.1 to requirements.txt, or re-save the file as .xlsx and "
+            "re-upload."
+        )
+    xls_wb = xlrd.open_workbook(file_contents=file_bytes)
+    sheets = [_XlrdSheetAdapter(xls_wb.sheet_by_index(i)) for i in range(xls_wb.nsheets)]
+    return sheets, None
+
+
 def _parse_monthly_status_report(file_bytes: bytes, filename: str = "", target_year: Optional[int] = None, target_month: Optional[int] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Parse the 'Monthly Status Report (Basic Work Duration)' ESSL export format.
 
@@ -1804,11 +1861,11 @@ def _parse_monthly_status_report(file_bytes: bytes, filename: str = "", target_y
 
     Returns (records, debug_info).
     """
-    wb = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
+    sheets, wb = _load_workbook_any(file_bytes, filename)
     all_records: List[Dict[str, Any]] = []
     debug = {"sheets_parsed": 0, "employees_found": 0, "dates_found": [], "issues": []}
 
-    for ws in wb.worksheets:
+    for ws in sheets:
         rows = list(ws.iter_rows(values_only=True))
         if not rows or len(rows) < 10:
             debug["issues"].append(f"Sheet '{ws.title}': too small ({len(rows)} rows)")
@@ -1888,20 +1945,43 @@ def _parse_monthly_status_report(file_bytes: bytes, filename: str = "", target_y
 
             # Department row
             if cell0 == "Department:":
-                current_department = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                # FIX: same fixed-offset bug as Emp. Code - scan forward for the
+                # first non-empty cell instead of assuming row[1].
+                current_department = ""
+                for j in range(1, len(row)):
+                    if row[j] is not None and str(row[j]).strip():
+                        current_department = str(row[j]).strip()
+                        break
                 i += 1
                 continue
 
             # Employee header row: "Emp. Code:" | code | ... | "Emp. Name:" | name
             if cell0 == "Emp. Code:":
-                emp_code = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
-                emp_name = ""
-
-                # Look for "Emp. Name:" label anywhere in this row
-                for j in range(2, len(row)):
-                    if str(row[j]).strip() == "Emp. Name:" and j + 1 < len(row) and row[j + 1] is not None:
-                        emp_name = str(row[j + 1]).strip()
+                # FIX: the code value isn't always at row[1] - real exports have
+                # blank/merged cells between the "Emp. Code:" label and the actual
+                # value (e.g. label at col 0, value at col 3). Scan forward for the
+                # first non-empty cell instead of assuming a fixed offset.
+                emp_code = ""
+                name_label_idx = None
+                for j in range(1, len(row)):
+                    val = row[j]
+                    if val is None:
+                        continue
+                    sval = str(val).strip()
+                    if not sval:
+                        continue
+                    if sval == "Emp. Name:":
+                        name_label_idx = j
                         break
+                    if not emp_code:
+                        emp_code = sval
+
+                emp_name = ""
+                if name_label_idx is not None:
+                    for j in range(name_label_idx + 1, len(row)):
+                        if row[j] is not None and str(row[j]).strip():
+                            emp_name = str(row[j]).strip()
+                            break
 
                 # Fallback: scan for a long name-like string
                 if not emp_name:
@@ -1976,7 +2056,8 @@ def _parse_monthly_status_report(file_bytes: bytes, filename: str = "", target_y
 
         debug["sheets_parsed"] += 1
 
-    wb.close()
+    if wb:
+        wb.close()
     return all_records, debug
 
 # ============================================================================
@@ -2418,6 +2499,15 @@ _TATA_HEADER_KEYWORDS = {
     "shift_late": ["shift late", "shift_late", "late shift", "late_shift"],
 }
 
+# FIX: bare "PR" (as used in Seabird's combined ESSL+Tata reference files) needs an
+# EXACT match, not substring - unlike the multi-word keywords above, a 2-letter
+# keyword like "pr" would false-positive on totally unrelated headers ("Approved",
+# "Printed", etc. all contain "pr" as a substring). Kept separate from
+# _TATA_HEADER_KEYWORDS so the substring-matching loop below can treat it differently.
+_TATA_HEADER_EXACT_KEYWORDS = {
+    "paycode": ["pr"],
+}
+
 def _normalize_header(header: str) -> str:
     """Normalize a header string for fuzzy matching."""
     if header is None:
@@ -2441,6 +2531,21 @@ def _find_tata_header_row(raw_rows: List[List[Any]], max_scan: int = 15) -> Opti
             norm = _normalize_header(str(cell))
             if not norm:
                 continue
+            # FIX: exact-match keywords (e.g. bare "pr") first, so a 2-letter code
+            # doesn't get skipped just because it's shorter than the substring
+            # keywords below - but also doesn't false-positive on unrelated columns
+            # via substring matching (see _TATA_HEADER_EXACT_KEYWORDS comment).
+            matched = False
+            for canonical, exact_kws in _TATA_HEADER_EXACT_KEYWORDS.items():
+                if canonical in col_map:
+                    continue
+                if norm in exact_kws:
+                    col_map[canonical] = j
+                    score += 1
+                    matched = True
+                    break
+            if matched:
+                continue
             for canonical, keywords in _TATA_HEADER_KEYWORDS.items():
                 if canonical in col_map:
                     continue  # already mapped
@@ -2449,6 +2554,20 @@ def _find_tata_header_row(raw_rows: List[List[Any]], max_scan: int = 15) -> Opti
                         col_map[canonical] = j
                         score += 1
                         break
+
+        # FIX: in combined ESSL+Tata reference files, columns like "ESSL IN"/"ESSL OUT"
+        # also contain the bare word "in"/"out" and - since they appear earlier in the
+        # row - would otherwise win the generic in_time/out_time match above. Explicit
+        # "Tata In"/"Tata Out" columns are the correct source and must take priority.
+        for j, cell in enumerate(row):
+            if cell is None:
+                continue
+            norm = _normalize_header(str(cell))
+            if norm in ("tata in", "tata in time", "tatain"):
+                col_map["in_time"] = j
+            elif norm in ("tata out", "tata out time", "tataout"):
+                col_map["out_time"] = j
+
         # A good header row should have at least paycode + name + date, or paycode + in_time + out_time
         has_essentials = ("paycode" in col_map and "emp_name" in col_map) or                          ("paycode" in col_map and ("in_time" in col_map or "out_time" in col_map))
         if has_essentials and score > best_score:
