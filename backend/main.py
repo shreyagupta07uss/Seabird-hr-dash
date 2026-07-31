@@ -6852,6 +6852,13 @@ def download_dump_report(
                 row_num = start_row + i
                 # Compute remark from punch times for multi-shift detection
                 remark = determine_worked_shift(r.essl_in, r.essl_out, r.tata_in, r.tata_out, r.shift, r.remark)
+                # FIX v3.2.13: For absent employees, show "N/A" instead of the
+                # assigned-shift fallback (e.g. "G") that determine_worked_shift
+                # returns when there are no punches to compute a real shift from -
+                # that fallback made every absent row's Remark column silently
+                # read as if they'd worked the General shift.
+                if r.attendance_status == "Absent":
+                    remark = "N/A"
                 ws.append([
                     emp.bio_id if emp else "",
                     r.pr_number,
