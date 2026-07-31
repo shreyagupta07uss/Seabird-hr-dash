@@ -2490,8 +2490,8 @@ _TATA_HEADER_KEYWORDS = {
     "man_hrs": ["man hrs", "man_hrs", "manhours", "man hours", "hours", "worked hours", "worked_hours", "total hours", "total_hours", "hrs"],
     "status": ["status", "att status", "attendance status", "att_status", "present status", "present_status"],
     "shift": ["shift", "shift in time", "shift_in_time", "shift time", "shift_time", "sft"],
-    "department": ["department", "dept", "division", "section", "deptt"],
-    "division": ["division", "dept", "department", "section"],
+    "department": ["department", "dept", "section", "deptt"],
+    "division": ["division", "dept", "section"],
     "category": ["wc/bc", "wc_bc", "wc-bc", "category", "wc", "bc", "wc bc"],
     "contractor": ["contractor", "vendor", "agency", "subcontractor", "sub contractor"],
     "store": ["store", "location", "plant", "unit", "site"],
@@ -2520,21 +2520,35 @@ def _find_tata_header_row(raw_rows: List[List[Any]], max_scan: int = 15) -> Opti
     best_score = 0
     best_result = None
 
+    # FIX: real Tata exports include decoy columns whose header TEXT overlaps a
+    # keyword via substring even though the column means something totally
+    # different - "Date of Birth" contains "date", "Shift In Time" (the scheduled
+    # reference start time) contains "in time". Substring matching alone let these
+    # win over the real "Date"/"In Time" columns whenever the decoy appeared first
+    # in the row, silently corrupting every attendance date and punch time. These
+    # substrings are never allowed to satisfy the given canonical.
+    _EXCLUDE_SUBSTR = {
+        "date": ["birth", "dob"],
+        "in_time": ["shift"],
+        "out_time": ["shift"],
+    }
+
     for i, row in enumerate(raw_rows[:max_scan]):
         if not row or len(row) < 3:
             continue
         col_map = {}
         score = 0
+
+        # Pass 1: EXACT header-text matches only (after normalization) - highest
+        # confidence, and resolves ambiguity before any substring fallback runs.
+        # E.g. a column literally named "Date" is claimed here before "Date of
+        # Birth" ever gets a chance to via substring matching in pass 2.
         for j, cell in enumerate(row):
             if cell is None:
                 continue
             norm = _normalize_header(str(cell))
             if not norm:
                 continue
-            # FIX: exact-match keywords (e.g. bare "pr") first, so a 2-letter code
-            # doesn't get skipped just because it's shorter than the substring
-            # keywords below - but also doesn't false-positive on unrelated columns
-            # via substring matching (see _TATA_HEADER_EXACT_KEYWORDS comment).
             matched = False
             for canonical, exact_kws in _TATA_HEADER_EXACT_KEYWORDS.items():
                 if canonical in col_map:
@@ -2548,9 +2562,27 @@ def _find_tata_header_row(raw_rows: List[List[Any]], max_scan: int = 15) -> Opti
                 continue
             for canonical, keywords in _TATA_HEADER_KEYWORDS.items():
                 if canonical in col_map:
+                    continue
+                if norm in keywords:  # exact equality against a keyword, not substring
+                    col_map[canonical] = j
+                    score += 1
+                    break
+
+        # Pass 2: substring fallback for anything still unmapped, guarded by the
+        # exclusion list above so decoy columns can't be picked even loosely.
+        for j, cell in enumerate(row):
+            if cell is None:
+                continue
+            norm = _normalize_header(str(cell))
+            if not norm:
+                continue
+            for canonical, keywords in _TATA_HEADER_KEYWORDS.items():
+                if canonical in col_map:
                     continue  # already mapped
+                if any(bad in norm for bad in _EXCLUDE_SUBSTR.get(canonical, [])):
+                    continue  # decoy column - never allowed to match this canonical
                 for kw in keywords:
-                    if kw == norm or kw in norm:
+                    if kw in norm:
                         col_map[canonical] = j
                         score += 1
                         break
