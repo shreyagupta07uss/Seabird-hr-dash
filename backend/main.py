@@ -5113,6 +5113,26 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
         status_map = {"P": "Present", "A": "Absent", "SP": "Single Punch", "L": "Leave", "HD": "Half Day", "WO": "Week Off"}
         display_status = status_map.get(attendance_status, attendance_status)
 
+        # FIX: PUNCH-PRESENCE OVERRIDE. determine_attendance_status() trusts an explicit
+        # status marker (e.g. Tata's own "A"/Absent status column) and returns early
+        # without ever looking at the punch times when that marker says Absent - even
+        # if a real punch exists on ESSL or Tata. That silently marked genuinely-worked
+        # employees Absent whenever the source status field disagreed with the punch
+        # data. Business rule: if ANY of the 4 raw punch fields (ESSL In, ESSL Out,
+        # Tata In, Tata Out) has a value, the employee is Present - a complete pair on
+        # either side gives full "Present", a lone punch gives "Single Punch" - and this
+        # takes priority over an explicit Absent marker from any source.
+        any_punch_present = bool(essl_in or essl_out or tata_in or tata_out)
+        if any_punch_present and display_status == "Absent":
+            if (essl_in and essl_out) or (tata_in and tata_out):
+                display_status = "Present"
+                attendance_status = "P"
+            else:
+                display_status = "Single Punch"
+                attendance_status = "SP"
+            if not remark:
+                remark = "Punch recorded (ESSL/Tata) - overriding explicit Absent status marker"
+
         # FIX v3.2.7: Override to "Week Off" if ESSL says WO and no punches
         if essl_status == "WO" and not has_any_punches:
             display_status = "Week Off"
@@ -5645,6 +5665,21 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
 
                 status_map = {"P": "Present", "A": "Absent", "SP": "Single Punch", "L": "Leave", "HD": "Half Day", "WO": "Week Off"}
                 display_status = status_map.get(attendance_status, attendance_status)
+
+                # FIX: PUNCH-PRESENCE OVERRIDE (see _reconcile_single_date for full rationale).
+                # If ANY of the 4 raw punch fields (ESSL In, ESSL Out, Tata In, Tata Out) has a
+                # value, the employee is Present - a complete pair gives full "Present", a lone
+                # punch gives "Single Punch" - overriding an explicit Absent status marker.
+                any_punch_present = bool(essl_in or essl_out or tata_in or tata_out)
+                if any_punch_present and display_status == "Absent":
+                    if (essl_in and essl_out) or (tata_in and tata_out):
+                        display_status = "Present"
+                        attendance_status = "P"
+                    else:
+                        display_status = "Single Punch"
+                        attendance_status = "SP"
+                    if not remark:
+                        remark = "Punch recorded (ESSL/Tata) - overriding explicit Absent status marker"
 
                 # FIX v3.2.7: Override to "Week Off" if ESSL says WO and no punches
                 if essl_status == "WO" and not has_any_punches:
