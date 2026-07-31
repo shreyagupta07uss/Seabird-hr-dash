@@ -4987,6 +4987,12 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
     # thrown away. Master's status label is still shown on each row for HR's
     # own review; it just no longer gates whether the row is generated at all.
     employees = db.query(Employee).all()
+    emp_ids = [e.id for e in employees]
+    emp_by_id = {e.id: e for e in employees}
+
+    # FIX v3.2: Pre-fetch ALL related records for this date in bulk queries
+    # FIX v3.2.1: Use pr_number instead of employee_id for reliable matching
+    all_pr_numbers = [e.pr_number for e in employees if e.pr_number]
 
     # TATA-ONLY DETECTION: employees with Tata data but NO ESSL data for this date
     tata_only_prs = set()
