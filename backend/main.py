@@ -1129,6 +1129,17 @@ def read_excel_bytes_to_dicts(file_bytes: bytes, sheet_index: int = 0) -> List[D
             continue
         row_dict = {}
         for i, header in enumerate(headers):
+            # FIX: real-world exports (e.g. Master roster) sometimes contain two
+            # columns with the identical header text (e.g. "Status" appearing
+            # twice - once as the real HR status, once as a stray leftover
+            # tracking column). Blindly overwriting row_dict[header] on every
+            # match let the LAST matching column silently win, which was
+            # clobbering a correct "ACTIVE" value with a stale "LEFT"/"#N/A"
+            # from the decoy duplicate column - wrongly deactivating employees
+            # who were still working. Keep the FIRST occurrence of any
+            # duplicate header name instead.
+            if header in row_dict:
+                continue
             row_dict[header] = row[i] if i < len(row) else None
         result.append(row_dict)
     wb.close()
@@ -1154,6 +1165,11 @@ def read_excel_all_sheets_to_dicts(file_bytes: bytes, required_any_header: Optio
                 continue
             row_dict = {}
             for i, header in enumerate(headers):
+                # FIX: see read_excel_bytes_to_dicts - keep first occurrence of a
+                # duplicate header name so a decoy duplicate column can't
+                # silently overwrite the real one.
+                if header in row_dict:
+                    continue
                 row_dict[header] = row[i] if i < len(row) else None
             all_rows.append(row_dict)
     wb.close()
@@ -5051,22 +5067,37 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
         single_punch = "Yes" if punch_count == 1 else "No"
 
         # TATA PRIORITY: Determine which source to use for OT/worked_hours calculation
-        tata_has_punches = bool(tata_in or tata_out)
+        # FIX: previously "tata_has_punches" was true if EITHER tata_in OR tata_out
+        # existed, so a Tata single-punch (e.g. only an In-time, no Out) was still
+        # treated as sufficient and used on its own for the hours calc - even when
+        # ESSL had a complete In+Out pair for the same day. Since you can't compute
+        # a duration from one timestamp, this silently produced worked_hours=0 for
+        # employees who had genuinely worked a full shift per ESSL, showing them as
+        # absent/zero hours in the dump. Only prefer Tata outright when it has a
+        # COMPLETE pair; otherwise prefer ESSL if ESSL has a complete pair; only as
+        # a last resort mix whichever single punches are available from either side.
+        tata_complete = bool(tata_in and tata_out)
+        essl_complete = bool(essl_in and essl_out)
         tata_has_man_hrs = bool(tata_man_hrs and tata_man_hrs > 0)
         essl_has_punches = bool(essl_in or essl_out)
+        tata_has_punches = bool(tata_in or tata_out)
 
-        # Priority: Tata punches > Tata man_hrs > ESSL punches > 0
-        if tata_has_punches:
-            # Tata has punches → calculate OT from Tata punches
+        # Priority: Tata complete pair > ESSL complete pair > Tata man_hrs > mixed/partial punches > 0
+        if tata_complete:
             ot_in_time, ot_out_time = tata_in, tata_out
             force_man_hrs = False
+        elif essl_complete:
+            ot_in_time, ot_out_time = essl_in, essl_out
+            force_man_hrs = False
         elif tata_has_man_hrs:
-            # Tata has no punches but has man_hrs → use man_hrs for worked_hours
+            # Tata has no complete punch pair but has man_hrs → use man_hrs for worked_hours
             ot_in_time, ot_out_time = None, None
             force_man_hrs = True
-        elif essl_has_punches:
-            # No Tata data → use ESSL punches
-            ot_in_time, ot_out_time = essl_in, essl_out
+        elif tata_has_punches or essl_has_punches:
+            # Both sources are single-punch at best - combine whichever side has an
+            # In and whichever side has an Out rather than defaulting to zero.
+            ot_in_time = tata_in or essl_in
+            ot_out_time = tata_out or essl_out
             force_man_hrs = False
         else:
             ot_in_time, ot_out_time = None, None
