@@ -600,6 +600,11 @@ BEHAVIORAL_ALERT_CONFIG = {"default_consecutive_days": 3}
 OT_WEEKLY_THRESHOLD = 12.0   # hours per rolling 7-day window
 OT_MONTHLY_THRESHOLD = 48.0  # hours per calendar month
 
+# ESSL vs Tata reconciliation: minimum in/out time gap (minutes) before a day is
+# flagged as "Mismatch" / "Time Difference". Used by both _reconcile_single_date
+# and _run_reconciliation_month_core so the two stay in sync.
+MISMATCH_THRESHOLD_MINUTES = 30
+
 ACTIVE_STATUS = {"ACTIVE", "OK", "ON LEAVE", "TRANSFER"}
 INACTIVE_STATUS = {"LEFT", "NOT OK", "RESIGNED", "TERMINATED"}
 
@@ -5042,7 +5047,7 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
                 match_delta_in = abs(time_to_minutes(essl_in) - time_to_minutes(tata_in))
             if essl_out and tata_out:
                 match_delta_out = abs(time_to_minutes(essl_out) - time_to_minutes(tata_out))
-            if match_delta_in > 15 or match_delta_out > 15:
+            if match_delta_in > MISMATCH_THRESHOLD_MINUTES or match_delta_out > MISMATCH_THRESHOLD_MINUTES:
                 match_status = "Mismatch"
                 reconciliation_severity = "Medium"
             else:
@@ -5181,8 +5186,8 @@ def _reconcile_single_date(d: date, db: Session) -> Dict[str, Any]:
         elif has_essl and not has_tata:
             issue = "Missing Tata Punch"
         elif match_status == "Mismatch":
-            if abs(match_delta_in) > 30 or abs(match_delta_out) > 30:
-                issue = "Time Difference (>30 min)"
+            if abs(match_delta_in) > MISMATCH_THRESHOLD_MINUTES or abs(match_delta_out) > MISMATCH_THRESHOLD_MINUTES:
+                issue = f"Time Difference (>{MISMATCH_THRESHOLD_MINUTES} min)"
             else:
                 issue = "Time Difference"
         # FIX v3.2.4: Check summary flags instead of display_status for sub-issues
@@ -5609,7 +5614,7 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                         match_delta_in = abs(time_to_minutes(essl_in) - time_to_minutes(tata_in))
                     if essl_out and tata_out:
                         match_delta_out = abs(time_to_minutes(essl_out) - time_to_minutes(tata_out))
-                    if match_delta_in > 15 or match_delta_out > 15:
+                    if match_delta_in > MISMATCH_THRESHOLD_MINUTES or match_delta_out > MISMATCH_THRESHOLD_MINUTES:
                         match_status = "Mismatch"
                         reconciliation_severity = "Medium"
                     else:
@@ -5724,8 +5729,8 @@ def _run_reconciliation_month_core(month: str, db: Session, job_id: Optional[str
                 elif has_essl and not has_tata:
                     issue = "Missing Tata Punch"
                 elif match_status == "Mismatch":
-                    if abs(match_delta_in) > 30 or abs(match_delta_out) > 30:
-                        issue = "Time Difference (>30 min)"
+                    if abs(match_delta_in) > MISMATCH_THRESHOLD_MINUTES or abs(match_delta_out) > MISMATCH_THRESHOLD_MINUTES:
+                        issue = f"Time Difference (>{MISMATCH_THRESHOLD_MINUTES} min)"
                     else:
                         issue = "Time Difference"
                 # FIX v3.2.4: Check summary flags instead of display_status for sub-issues
